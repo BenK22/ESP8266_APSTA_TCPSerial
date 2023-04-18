@@ -1,6 +1,29 @@
 #include <ESP8266WiFi.h>
 #include <EEPROM.h>
 #include <ESP8266WebServer.h>
+#include <PubSubClient.h>
+
+struct EcmData {
+  float voltage;
+  uint64_t wattSeconds[7];
+  uint64_t prevWattSeconds[7];
+  uint64_t polWattSeconds[2];
+  uint64_t prevPolWattSeconds[2];
+  uint16_t seconds;
+  uint16_t prevSeconds;
+  String serialNumber;
+};
+
+EcmData ecmData = {
+  0.0,                      // voltage
+  { 0, 0, 0, 0, 0, 0, 0 },  // wattSeconds
+  { 0, 0, 0, 0, 0, 0, 0 },  // prevWattSeconds
+  { 0, 0 },  // polWattSeconds
+  { 0, 0 },  // prevPolWattSeconds
+  0,                        // serialNumber
+  0,                        // seconds
+  "0"                         // prevSeconds
+};
 
 // Replace with your SSID and password
 char ssid[32] = "";
@@ -27,12 +50,18 @@ WiFiClient client;
 WiFiClient clientTwo;
 
 ESP8266WebServer server(80);
+PubSubClient mqttClient(clientTwo);
 
 String tcpIp = "";
 int tcpPort = 0;
 
 int tcpServerPort = 8000;
 WiFiServer ecmServer(5555);
+
+const char* mqttServer = "mqtt_server_address";
+const char* mqttUser = "mqtt_username";
+const char* mqttPass = "mqtt_password";
+const int mqttPort = 1883;
 
 void setup() {
   // Start EEPROM
@@ -103,6 +132,8 @@ void setup() {
     server.on("/config", handleConfig);
     server.on("/serial-to-tcp", handleSerialToTcp);
     server.on("/serial-to-tcp-server", handleSerialToTcpServer);
+
+    mqttClient.setServer(mqttServer, mqttPort);
   }
 
   server.begin();
@@ -128,6 +159,7 @@ void loop() {
         dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
         ecmClient.write(buffer, dataLength);  // Send the entire buffer to the server
+        handlePacket();
       }
     }
 
@@ -141,6 +173,8 @@ void loop() {
       dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
       client.write(buffer, dataLength);  // Send the entire buffer to the server
+      
+      handlePacket();
     }
 
     if (client.available()) {
@@ -156,6 +190,34 @@ void loop() {
   }
 
   delay(50);
+}
+
+void handlePacket() {
+  if (dataLength >= 65) {
+    // Validate the first three bytes and last 2 bytes
+    if (buffer[0] == 0xFE && buffer[1] == 0xFF && buffer[2] == 0x03 && buffer[62] == 0xFF && buffer[63] == 0xFE) {
+      // Extract the voltage value as an unsigned integer
+      ecmData.voltage = ((buffer[3] << 8) | buffer[4]) / 10;
+      ecmData.seconds = ((uint16_t)buffer[39] << 16) | ((uint16_t)buffer[38] << 8) | (uint16_t)buffer[37];
+
+      memcpy(ecmData.prevWattSeconds, ecmData.wattSeconds, sizeof(ecmData.prevWattSeconds));
+      memcpy(ecmData.prevPolWattSeconds, ecmData.polWattSeconds, sizeof(ecmData.prevPolWattSeconds));
+      
+      // Extract the 4-byte value as an unsigned integer
+      ecmData.wattSeconds[0] = ((uint64_t)buffer[9] << 32) | ((uint64_t)buffer[8] << 24) | ((uint64_t)buffer[7] << 16) | ((uint64_t)buffer[6] << 8) | (uint64_t)buffer[5];
+      ecmData.wattSeconds[1] = ((uint64_t)buffer[14] << 32) | ((uint64_t)buffer[13] << 24) | ((uint64_t)buffer[12] << 16) | ((uint64_t)buffer[11] << 8) | (uint64_t)buffer[10];
+      ecmData.wattSeconds[2] = ((uint64_t)buffer[43] << 24) | ((uint64_t)buffer[42] << 16) | ((uint64_t)buffer[41] << 8) | (uint64_t)buffer[40];
+      ecmData.wattSeconds[3] = ((uint64_t)buffer[47] << 24) | ((uint64_t)buffer[46] << 16) | ((uint64_t)buffer[45] << 8) | (uint64_t)buffer[44];
+      ecmData.wattSeconds[4] = ((uint64_t)buffer[51] << 24) | ((uint64_t)buffer[50] << 16) | ((uint64_t)buffer[49] << 8) | (uint64_t)buffer[48];
+      ecmData.wattSeconds[5] = ((uint64_t)buffer[55] << 24) | ((uint64_t)buffer[54] << 16) | ((uint64_t)buffer[53] << 8) | (uint64_t)buffer[52];
+      ecmData.wattSeconds[6] = ((uint64_t)buffer[59] << 24) | ((uint64_t)buffer[58] << 16) | ((uint64_t)buffer[57] << 8) | (uint64_t)buffer[56];
+
+      ecmData.polWattSeconds[0] = ((uint64_t)buffer[19] << 32) | ((uint64_t)buffer[18] << 24) | ((uint64_t)buffer[17] << 16) | ((uint64_t)buffer[16] << 8) | (uint64_t)buffer[15];
+      ecmData.polWattSeconds[1] = ((uint64_t)buffer[24] << 32) | ((uint64_t)buffer[23] << 24) | ((uint64_t)buffer[22] << 16) | ((uint64_t)buffer[21] << 8) | (uint64_t)buffer[20];
+
+      ecmData.serialNumber = String((uint16_t)buffer[32]) + String(((buffer[29] << 8) | buffer[30]));
+    }
+  }
 }
 
 void handleRoot() {
@@ -223,6 +285,12 @@ void handleStationMode() {
   html += "Port: <input type='number' name='port' value='" + String(tcpServerPort) + "'><br>";
   html += "<input type='submit' value='Save'>";
   html += "</form>";
+  html += "<div>ECM-1240 Data:<br><br>Serial: " + String(ecmData.serialNumber) + "  V: " + String(ecmData.voltage) + "  S: " + String(ecmData.seconds);
+  html += "<br><br>Wattseconds:<br>CH1: " + String(ecmData.wattSeconds[0]) + " CH2: " + String(ecmData.wattSeconds[1]);
+  html += "<br>CH3: " + String(ecmData.wattSeconds[2]) + " CH4: " + String(ecmData.wattSeconds[3]);
+  html += "<br>CH5: " + String(ecmData.wattSeconds[4]) + " CH6: " + String(ecmData.wattSeconds[5]);
+  html += "<br>CH7: " + String(ecmData.wattSeconds[6]);
+  html += "<br><br>Polarized Wattseconds:<br>CH1: " + String(ecmData.polWattSeconds[0]) + " CH2: " + String(ecmData.polWattSeconds[1]);
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
