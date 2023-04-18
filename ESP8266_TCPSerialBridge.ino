@@ -15,14 +15,24 @@ const int passwordAddress = 33;
 const int isFirstRunAddress = 66;
 const int tcpPortAddress = 68;
 const int tcpIPAddress = 75;
+const int tcpServerPortAddress = 100;
 const byte isFirstRunValue = 0xAA;
 
+// Serial buffer
+const int MAX_DATA_LENGTH = 512;  // Set the maximum length of the data
+char buffer[MAX_DATA_LENGTH];     // Declare the array to store the data
+int dataLength = 0;               // Declare a variable to keep track of the length of the data
+
 WiFiClient client;
+WiFiClient clientTwo;
 
 ESP8266WebServer server(80);
 
 String tcpIp = "";
 int tcpPort = 0;
+
+int tcpServerPort = 8000;
+WiFiServer ecmServer(5555);
 
 void setup() {
   // Start EEPROM
@@ -31,11 +41,11 @@ void setup() {
   // Start serial port
   Serial.begin(19200);
   Serial.flush();
+  Serial.setTimeout(500);
 
   // Check if this is the first run
   byte isFirstRun = EEPROM.read(isFirstRunAddress);
   if (isFirstRun != isFirstRunValue) {
-    Serial.println("Clearing EEPROM...");
     for (int i = 0; i < eepromSize; i++) {
       EEPROM.write(i, 0);
     }
@@ -59,6 +69,7 @@ void setup() {
   }
 
   EEPROM.get(tcpPortAddress, tcpPort);
+  EEPROM.get(tcpServerPortAddress, tcpServerPort);
 
   // Connect to saved network
   if (strcmp(ssid, "") != 0 && strcmp(password, "") != 0) {
@@ -69,7 +80,6 @@ void setup() {
 
     while (WiFi.status() != WL_CONNECTED) {
       delay(1000);
-      Serial.print(".");
 
       if (x > 20) {
         break;
@@ -89,42 +99,59 @@ void setup() {
     server.on("/", handleRoot);
     server.on("/config", handleConfig);
   } else {
-    Serial.println(WiFi.localIP());
-
     server.on("/", handleStationMode);
     server.on("/config", handleConfig);
     server.on("/serial-to-tcp", handleSerialToTcp);
+    server.on("/serial-to-tcp-server", handleSerialToTcpServer);
   }
 
   server.begin();
+  ecmServer.stop();
+  ecmServer.begin(tcpServerPort);
 }
 
 void loop() {
   server.handleClient();
 
+  WiFiClient ecmClient = ecmServer.available();
+
+  if (ecmClient) {
+    ecmClient.setTimeout(100);
+    while (ecmClient.connected()) {
+      if (ecmClient.available()) {
+        dataLength = ecmClient.readBytes(buffer, sizeof(buffer));  // Read all available data from WiFi and store it in the buffer
+
+        Serial.write(buffer, dataLength);  // Send the entire buffer to the ECM-1240
+      }
+
+      if (Serial.available()) {
+        dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
+
+        ecmClient.write(buffer, dataLength);  // Send the entire buffer to the server
+      }
+    }
+
+    ecmClient.stop();
+  }
+
   if (client.connected()) {
 
     // Handle the data passthru
     if (Serial.available()) {
-      while (Serial.available()) {
-        client.write(Serial.read());
-        delay(5);
-      }
+      dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
-      delay(50);
+      client.write(buffer, dataLength);  // Send the entire buffer to the server
     }
 
     if (client.available()) {
-      while (client.available()) {
-        Serial.print((char)client.read());
-        delay(5);
-      }
+      dataLength = client.readBytes(buffer, sizeof(buffer));  // Read all available data from WiFi and store it in the buffer
 
-      delay(50);
+      Serial.write(buffer, dataLength);  // Send the entire buffer to the ECM-1240
     }
   } else {
     if (!client.connected() && isValidIP(tcpIp) && tcpPort > 1024 && tcpPort < 65536) {
       client.connect(tcpIp.c_str(), tcpPort);
+      client.setTimeout(100);
     }
   }
 
@@ -186,11 +213,15 @@ void handleStationMode() {
   html += "Password: <input type='password' name='password' value='" + String(password) + "'><br>";
   html += "<input type='submit' value='Connect'>";
   html += "</form>";
-  html += "<h3>Serial to TCP Client</h3>";
+  html += "<br><h3>Serial to TCP Client</h3>";
   html += "<form action='/serial-to-tcp'>";
   html += "IP address: <input type='text' name='ip' value=''><br>";
   html += "Port: <input type='number' name='port' value=''><br>";
   html += "<input type='submit' value='Connect'>";
+  html += "</form>";
+  html += "<br><form action='/serial-to-tcp-server'>";
+  html += "Port: <input type='number' name='port' value='" + String(tcpServerPort) + "'><br>";
+  html += "<input type='submit' value='Save'>";
   html += "</form>";
   html += "</body></html>";
   server.send(200, "text/html", html);
@@ -224,6 +255,7 @@ void handleSerialToTcp() {
       client.stop();
 
       if (client.connect(tcpIp.c_str(), tcpPort)) {
+        client.setTimeout(100);
         html += "<h5>Connected to TCP server</h5>";
       } else {
         html += "<h5>Connection failed</h5>";
@@ -232,6 +264,32 @@ void handleSerialToTcp() {
 
   } else {
     html += "<h2>Invalid IP Address or Port</h2>";
+  }
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSerialToTcpServer() {
+  // Serial to TCP client connection
+  int port = server.arg("port").toInt();
+
+  String html = "<html><body>";
+
+  // Error test the client connection
+  if (port > 1024 && port < 65536) {
+
+    EEPROM.put(tcpServerPortAddress, port);
+    EEPROM.commit();
+
+    tcpServerPort = port;
+
+    html += "<h2>Port saved to EEPROM.  Starting server...</h2>";
+
+    ecmServer.stop();
+    ecmServer.begin(tcpServerPort);
+  } else {
+    html += "<h2>Port is out of range.</h2>";
   }
 
   html += "</body></html>";
