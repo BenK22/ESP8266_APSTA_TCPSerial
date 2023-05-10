@@ -3,6 +3,7 @@
 #include <ESP8266WebServer.h>
 #include <PubSubClient.h>
 #include <ESP8266mDNS.h>
+#include <ESP8266HTTPUpdateServer.h>
 
 struct EcmData {
   double voltage;
@@ -17,6 +18,19 @@ struct EcmData {
   uint16_t watts[7];
   uint16_t netWatts[2];
   double kwh[7];
+  double totalKwh[7];
+};
+
+struct EcmSettings {
+  bool gotSettings;
+  uint8_t ch1Set[2];
+  uint8_t ch2Set[2];
+  uint8_t ptSet[2];
+  uint8_t sendInterval;
+  double firmwareVersion;
+  String serialNumber;
+  bool auxX2[5];
+  uint8_t aux5Option;
 };
 
 EcmData ecmData = {
@@ -31,7 +45,20 @@ EcmData ecmData = {
   "0",                      // prevSeconds
   { 0, 0, 0, 0, 0, 0, 0 },  // wattSeconds
   { 0, 0 },                 // prevWattSeconds
-  { 0, 0, 0, 0, 0, 0, 0 }   // prevWattSeconds
+  { 0, 0, 0, 0, 0, 0, 0 },  // kwh
+  { 0, 0, 0, 0, 0, 0, 0 }   // totalKwh
+};
+
+EcmSettings ecmSettings = {
+  false,
+  { 0, 0 },                               // ch1Set
+  { 0, 0 },                               // ch2Set
+  { 0, 0 },                               // ptSet
+  0,                                      // packetSend
+  0.0,                                    // fimrware
+  "",                                     // serialNumber
+  { false, false, false, false, false },  // auxX2
+  0                                       // aux5Pulse
 };
 
 // Replace with your SSID and password
@@ -65,6 +92,7 @@ WiFiClient client;
 WiFiClient clientTwo;
 
 ESP8266WebServer server(80);
+ESP8266HTTPUpdateServer httpUpdater;
 PubSubClient mqttClient(clientTwo);
 
 String tcpIp = "";
@@ -87,7 +115,7 @@ String loginPass = "";
 const int LED_PIN = 0;  // GPIO0
 bool ledState = false;
 
-const String css = "<style> body { background-color:#f2f2f2; font-family: Arial, sans-serif; } div { background-color: #fff; border: 1px solid #ccc; box-shadow: 0 2px 2px rgba(0, 0, 0, 0.1); margin: 50px auto; max-width: 400px; padding: 20px; text-align: center; } h1 { margin: 0 0 20px 0; } label { padding-top:5px; display: block; font-size: 16px; font-weight: bold; margin-bottom: 5px; text-align: left; } input { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding: 10px; width: 100% ; } button { background-color: #4CAF50; border: none; color: #fff; cursor: pointer; font-size: 16px; margin-top: 20px; padding: 10px; width: 100% ; } button: hover { background-color: #45a049; } p.error { color: #f00; font-size: 14px; margin: 10px 0; text-align: left; } </style>";
+const int UPDATE_SIZE_UNKNOWN = -1;
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
@@ -127,11 +155,9 @@ void setup() {
     }
   }
 
+
   loginUser = getString(loginUserAddress);
   loginPass = getString(loginPassAddress);
-
-  Serial.println(loginUser);
-  Serial.println(loginPass);
 
   mqttServer = getString(mqttServerAddress);
   mqttUser = getString(mqttUserAddress);
@@ -174,9 +200,12 @@ void setup() {
     server.on("/config", handleConfig);
     server.on("/login-settings", handleLoginSettings);
     server.on("/serial-to-tcp", handleSerialToTcp);
+    server.on("/ecm-settings", handleECMSettings);
     server.on("/serial-to-tcp-server", handleSerialToTcpServer);
     server.on("/mqtt", handleMqtt);
     server.on("/send-ha", handleHA);
+    server.on("/ecm-data", handleECMData);
+    //server.on("/update", HTTP_POST, handleUpdate);
     MDNS.begin("esp8266");
     delay(1000);
   }
@@ -184,10 +213,12 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/login", handleLogin);
   //here the list of headers to be recorded
-  const char* headerkeys[] = { "User-Agent", "Cookie" };
+  const char* headerkeys[] = { "User-Agent", "Cookie", "Content-Type", "Content-Length", "Update-Size" };
   size_t headerkeyssize = sizeof(headerkeys) / sizeof(char*);
+
   //ask server to track these headers
   server.collectHeaders(headerkeys, headerkeyssize);
+  httpUpdater.setup(&server, loginUser, loginPass);
   server.begin();
 
   ecmServer.stop();
@@ -313,10 +344,11 @@ void processPacket() {
     }
 
     ecmData.watts[x] = ecmData.deltaWattSeconds[x] / secDiff;
-    ecmData.kwh[x] = static_cast<float>(ecmData.deltaWattSeconds[x]) / 360000;
-
-    mqttPost();
+    ecmData.kwh[x] = static_cast<float>(ecmData.deltaWattSeconds[x]) / 3600000;
+    ecmData.totalKwh[x] += ecmData.kwh[x];
   }
+
+  mqttPost();
 }
 
 void mqttPost() {
@@ -333,7 +365,8 @@ void mqttPost() {
 
     for (int i = 0; i < 7; i++) {
       mqttClient.publish(("ecm1240-" + String(ecmData.serialNumber) + "/c" + String(i + 1) + "/watt").c_str(), String(ecmData.watts[i]).c_str());
-      mqttClient.publish(("ecm1240-" + String(ecmData.serialNumber) + "/c" + String(i + 1) + "/kwh").c_str(), String(ecmData.kwh[i]).c_str());
+      mqttClient.publish(("ecm1240-" + String(ecmData.serialNumber) + "/c" + String(i + 1) + "/kwh").c_str(), String(ecmData.kwh[i], 5).c_str());
+      mqttClient.publish(("ecm1240-" + String(ecmData.serialNumber) + "/c" + String(i + 1) + "/total_kwh").c_str(), String(ecmData.totalKwh[i], 5).c_str());
       mqttClient.publish(("ecm1240-" + String(ecmData.serialNumber) + "/c" + String(i + 1) + "/ws").c_str(), String(ecmData.wattSeconds[i]).c_str());
       mqttClient.publish(("ecm1240-" + String(ecmData.serialNumber) + "/c" + String(i + 1) + "/pws").c_str(), String(ecmData.polWattSeconds[i]).c_str());
       mqttClient.publish(("ecm1240-" + String(ecmData.serialNumber) + "/c" + String(i + 1) + "/dws").c_str(), String(ecmData.deltaWattSeconds[i]).c_str());
@@ -348,33 +381,60 @@ void handleHA() {
   if (WiFi.status() == WL_CONNECTED) {
     mqttClient.setServer(mqttServer.c_str(), mqttPort);
 
+    String html = getHTMLHeader(0);
+
     if (!mqttClient.connect(mqttClientID.c_str(), mqttUser.c_str(), mqttPass.c_str())) {
+      html += "<div><h3>MQTT couldn't connect, please check your settings.</h3></div></html></body>";
+      server.send(200, "text/html", html);
       return;
     }
+    html += "<div><h3>MQTT Values Sent:</h3>";
+    String payload = "{\"unique_id\": \"" + ecmData.serialNumber + "v\", \"name\":\"ECM1240 " + ecmData.serialNumber + " Volts\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/v\",\"unit_of_measurement\":\"V\", \"state_class\": \"measurement\", \"dev\":{\"ids\":\"" + ecmData.serialNumber + "\",\"name\":\"ECM1240-" + ecmData.serialNumber + "\",\"sw\":\"esp8266-custom\",\"mdl\":\"ECM-1240\",\"mf\":\"BrulTech Research Inc.\"}}";
+    String topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/volts/config";
+    if (!mqttClient.publish(topic.c_str(), payload.c_str(), true)) {
+      html += "Not Sent: " + String(sizeof(payload)) + " " + String(MQTT_MAX_PACKET_SIZE) + "<br><br>";
+    }
 
-    String payload = "{\"name\":\"ECM1240 " + ecmData.serialNumber + " Volts\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/v\",\"unit_of_measurement\":\"V\"}";
-    String topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/voltage_sensor/config";
-    mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    html += payload + "<br><br>" + topic + "<br><br>";
 
     for (int x = 0; x < 7; x++) {
-      payload = "{\"name\":\"ECM1240 " + ecmData.serialNumber + " CH" + (x + 1) + " kWh\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/c" + (x + 1) + "/kwh\",\"unit_of_measurement\":\"kWh\"}";
-      topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/CH" + (x + 1) + "-kWh/config";
-      mqttClient.publish(topic.c_str(), payload.c_str(), true);
+      payload = "{\"unique_id\": \"" + ecmData.serialNumber + "ch" + (x + 1) + "kwh\", \"name\":\"ECM1240 " + ecmData.serialNumber + " CH" + (x + 1) + " kWh\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/c" + (x + 1) + "/kwh\",\"unit_of_measurement\":\"kWh\", \"state_class\": \"measurement\", \"dev\":{\"ids\":\"" + ecmData.serialNumber + "\",\"name\":\"ECM1240-" + ecmData.serialNumber + "\",\"sw\":\"esp8266-custom\",\"mdl\":\"ECM-1240\",\"mf\":\"BrulTech Research Inc.\"}}";
+      topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/ch" + (x + 1) + "_kwh/config";
+      if (!mqttClient.publish(topic.c_str(), payload.c_str())) {
+        html += "Not Sent:<br><br>";
+      }
 
-      
-      payload = "{\"name\":\"ECM1240 " + ecmData.serialNumber + " CH" + (x + 1) + " WattSeconds\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/c" + (x + 1) + "/dws\",\"unit_of_measurement\":\"WS\"}";
-      topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/CH" + (x + 1) + "-WS/config";
-      mqttClient.publish(topic.c_str(), payload.c_str(), true);
+      payload = "{\"unique_id\": \"" + ecmData.serialNumber + "ch" + (x + 1) + "_total_kwh\", \"name\":\"ECM1240 " + ecmData.serialNumber + " CH" + (x + 1) + " Total kWh\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/c" + (x + 1) + "/total_kwh\",\"unit_of_measurement\":\"kWh\", \"device_class\": \"energy\", \"state_class\": \"total_increasing\", \"last_reset\": \"1970-01-01T00:00:00+00:00\", \"dev\":{\"ids\":\"" + ecmData.serialNumber + "\",\"name\":\"ECM1240-" + ecmData.serialNumber + "\",\"sw\":\"esp8266-custom\",\"mdl\":\"ECM-1240\",\"mf\":\"BrulTech Research Inc.\"}}";
+      topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/ch" + (x + 1) + "_total_kwh/config";
+      if (!mqttClient.publish(topic.c_str(), payload.c_str())) {
+        html += "Not Sent:<br><br>";
+      }
 
-      
-      payload = "{\"name\":\"ECM1240 " + ecmData.serialNumber + " CH" + (x + 1) + " Watts\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/c" + (x + 1) + "/watt\",\"unit_of_measurement\":\"W\"}";
-      topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/CH" + (x + 1) + "-Watts/config";
-      mqttClient.publish(topic.c_str(), payload.c_str(), true);
+
+      html += payload + "<br><br>" + topic + "<br><br>";
+
+      payload = "{\"unique_id\": \"" + ecmData.serialNumber + "ch" + (x + 1) + "ws\", \"name\":\"ECM1240 " + ecmData.serialNumber + " CH" + (x + 1) + " WattSeconds\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/c" + (x + 1) + "/dws\",\"unit_of_measurement\":\"WS\", \"state_class\": \"measurement\", \"dev\":{\"ids\":\"" + ecmData.serialNumber + "\",\"name\":\"ECM1240-" + ecmData.serialNumber + "\",\"sw\":\"esp8266-custom\",\"mdl\":\"ECM-1240\",\"mf\":\"BrulTech Research Inc.\"}}";
+      topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/ch" + (x + 1) + "_ws/config";
+      if (!mqttClient.publish(topic.c_str(), payload.c_str())) {
+        html += "Not Sent:<br><br>";
+      }
+
+      html += payload + "<br><br>" + topic + "<br><br>";
+
+      payload = "{\"unique_id\": \"" + ecmData.serialNumber + "ch" + (x + 1) + "w\", \"name\":\"ECM1240 " + ecmData.serialNumber + " CH" + (x + 1) + " Watts\",\"state_topic\":\"ecm1240-" + ecmData.serialNumber + "/c" + (x + 1) + "/watt\",\"unit_of_measurement\":\"W\", \"state_class\": \"measurement\", \"dev\":{\"ids\":\"" + ecmData.serialNumber + "\",\"name\":\"ECM1240-" + ecmData.serialNumber + "\",\"sw\":\"esp8266-custom\",\"mdl\":\"ECM-1240\",\"mf\":\"BrulTech Research Inc.\"}}";
+      topic = "homeassistant/sensor/ecm1240-" + ecmData.serialNumber + "/ch" + (x + 1) + "_watts/config";
+      if (!mqttClient.publish(topic.c_str(), payload.c_str())) {
+        html += "Not Sent:<br><br>";
+      }
+
+      html += payload + "<br><br>" + topic + "<br><br>";
     }
 
     // Publish the auto-discovery payload to the MQTT broker
 
     mqttClient.disconnect();
+    html += "</div></body></html>";
+    server.send(200, "text/html", html);
   }
 }
 
@@ -383,7 +443,7 @@ void handleAP() {
     sendLogin(false);
   } else {
     // Root webpage
-    String html = "<html><body>";
+    String html = getHTMLHeader(0);
     html += "<h2>ESP8266 Configuration</h2>";
     html += "<form action='/config'>";
     html += "Select a network: <select name='ssid'>";
@@ -392,9 +452,9 @@ void handleAP() {
       html += "<option value='" + String(WiFi.SSID(i)) + "'>" + String(WiFi.SSID(i)) + "</option>";
     }
     html += "</select><br>";
-    html += "Or enter SSID: <input type='text' name='custom_ssid'><br>";
-    html += "Password: <input type='password' name='password'><br>";
-    html += "<input type='submit' value='Login'>";
+    html += "Or enter SSID: <input class='full' type='text' name='custom_ssid'><br>";
+    html += "Password: <input class='full' type='password' name='password'><br>";
+    html += "<button>Connect to Network</button>";
     html += "</form>";
     html += "</body></html>";
     server.send(200, "text/html", html);
@@ -427,14 +487,70 @@ void handleConfig() {
   ESP.restart();
 }
 
+String getECMSettings() {
+  byte data = 0xFC;  // binary 0xFC
+  Serial.write(data);
+  delay(100);
+  Serial.write("SETRCV");
+
+  if (Serial.available()) {
+    dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
+
+    if (dataLength > 32) {
+      processECMSettings();
+
+      return "true";
+    }
+  }
+
+  return "false";
+}
+
+void processECMSettings() {
+  // Validate the first three bytes and last 2 bytes
+  if (buffer[0] == 0xFC && buffer[1] == 0xFC && buffer[2] == 0xFC) {
+    // Extract the voltage value as an unsigned integer
+    ecmSettings.gotSettings = true;
+
+    ecmSettings.ch1Set[0] = (uint8_t)buffer[3];
+    ecmSettings.ch1Set[1] = (uint8_t)buffer[4];
+
+    ecmSettings.ch2Set[0] = (uint8_t)buffer[5];
+    ecmSettings.ch2Set[1] = (uint8_t)buffer[6];
+
+    ecmSettings.ptSet[0] = (uint8_t)buffer[7];
+    ecmSettings.ptSet[1] = (uint8_t)buffer[8];
+
+    ecmSettings.sendInterval = (uint8_t)buffer[9];
+
+    ecmSettings.firmwareVersion = static_cast<double>((buffer[11] << 8) | buffer[12]) / 1000;
+
+    ecmSettings.serialNumber = String((uint16_t)buffer[13]) + String(((buffer[14] << 8) | buffer[15]));
+    int i = 0;
+    for (i; i < 5; i++) {
+      ecmSettings.auxX2[i] = (buffer[17] & (1 << i)) != 0;
+    }
+
+    Serial.println(buffer[17]);
+
+    if ((buffer[17] & (1 << i)) != 0) {
+      ecmSettings.aux5Option = 1;
+    } else if ((buffer[17] & (1 << ++i)) != 0) {
+      ecmSettings.aux5Option = 3;
+    } else {
+      ecmSettings.aux5Option = 0;
+    }
+  }
+}
+
 void handleStationMode() {
   if (!isAuthenticated()) {
     sendLogin(false);
   } else {
+    ecmSettings.gotSettings = false;
+    getECMSettings();
     // Station mode webpage
-    String html = "<html><head>";
-    html += css;
-    html += "</head><body>";
+    String html = getHTMLHeader(1);
     html += "<div><form action='/config'><h3>Network Settings</h3>";
     html += "<h4>Connected to: " + String(WiFi.SSID()) + "</h4>";
     html += "<label>Select a network: <select name='ssid'>";
@@ -443,58 +559,283 @@ void handleStationMode() {
       html += "<option value='" + String(WiFi.SSID(i)) + "'>" + String(WiFi.SSID(i)) + "</option>";
     }
     html += "</select>";
-    html += "<label>or enter SSID:</label><input type='text' name='custom_ssid' value='" + String(ssid) + "'>";
-    html += "<label>Password:</label><input type='password' name='password' value=''>";
+    html += "<label>or enter SSID:</label><input class='full' type='text' name='custom_ssid' value='" + String(ssid) + "'>";
+    html += "<label>Password:</label><input class='full' type='password' name='password' value=''>";
     html += "<button>Submit</button>";
     html += "</form></div>";
     html += "<div><form action='/serial-to-tcp'><h3>Serial to TCP Client</h3>";
-    html += "<label>IP address:</label><input type='text' name='ip' value=''>";
-    html += "<label>Port:</label><input type='number' name='port' value=''>";
+    html += "<label>IP address:</label><input class='full' type='text' name='ip' value=''>";
+    html += "<label>Port:</label><input class='full' type='number' name='port' value=''>";
     html += "<button>Connect</button>";
     html += "</form></div>";
     html += "<div><form action='/serial-to-tcp-server'><h3>TCP Server Connection</h3>";
-    html += "<label>Port:</label><input type='number' name='port' value='" + String(tcpServerPort) + "'>";
+    html += "<label>Port:</label><input class='full' type='number' name='port' value='" + String(tcpServerPort) + "'>";
     html += "<button>Save</button>";
     html += "</form></div>";
     html += "<div><form action='/mqtt'><h3>MQTT Server Connection</h3>";
-    html += "<label>IP address/Domain:</label><input type='text' name='ip' value='" + String(mqttServer) + "'>";
-    html += "<label>Port:</label><input type='number' name='port' value='" + String(mqttPort) + "'>";
-    html += "<label>User:</label><input type='text' name='user' value='" + String(mqttUser) + "'>";
-    html += "<label>Password:</label><input type='pass' name='pass' value=''>";
+    html += "<label>IP address/Domain:</label><input class='full' type='text' name='ip' value='" + String(mqttServer) + "'>";
+    html += "<label>Port:</label><input class='full' type='number' name='port' value='" + String(mqttPort) + "'>";
+    html += "<label>User:</label><input class='full' type='text' name='user' value='" + String(mqttUser) + "'>";
+    html += "<label>Password:</label><input class='full' type='password' name='pass' value=''>";
     html += "<button>Save</button>";
     html += "</form><form action='/send-ha'><h3>Home-Assistant Config</h3>";
     html += "<button>Send Config</button>";
     html += "</form></div>";
     html += "<div><form action='/login-settings'><h3>Login Information</h3>";
-    html += "<label>User:</label><input type='text' name='user' value='" + String(loginUser) + "'>";
-    html += "<label>Password:</label><input type='pass' name='pass' value=''>";
+    html += "<label>User:</label><input class='full' type='text' name='user' value='" + String(loginUser) + "'>";
+    html += "<label>Password:</label><input class='full' type='password' name='pass' value=''>";
     html += "<button>Save</button>";
     html += "</form></div>";
-    html += "<div><h3>ECM-1240 Data:</h3><br>Serial: " + String(ecmData.serialNumber) + "  V: " + String(ecmData.voltage) + "  S: " + String(ecmData.seconds) + "  PS: " + String(ecmData.prevSeconds);
-    html += "<br><br>Wattseconds:<br>CH1: " + String(ecmData.wattSeconds[0]) + " CH2: " + String(ecmData.wattSeconds[1]);
-    html += "<br>CH3: " + String(ecmData.wattSeconds[2]) + " CH4: " + String(ecmData.wattSeconds[3]);
-    html += "<br>CH5: " + String(ecmData.wattSeconds[4]) + " CH6: " + String(ecmData.wattSeconds[5]);
-    html += "<br>CH7: " + String(ecmData.wattSeconds[6]);
-    html += "<br><br>Prev Wattseconds:<br>CH1: " + String(ecmData.prevWattSeconds[0]) + " CH2: " + String(ecmData.prevWattSeconds[1]);
-    html += "<br>CH3: " + String(ecmData.prevWattSeconds[2]) + " CH4: " + String(ecmData.prevWattSeconds[3]);
-    html += "<br>CH5: " + String(ecmData.prevWattSeconds[4]) + " CH6: " + String(ecmData.prevWattSeconds[5]);
-    html += "<br>CH7: " + String(ecmData.prevWattSeconds[6]);
-    html += "<br><br>Polarized Wattseconds:<br>CH1: " + String(ecmData.polWattSeconds[0]) + " CH2: " + String(ecmData.polWattSeconds[1]);
-    html += "<br><br>Watts:<br>CH1: " + String(ecmData.watts[0]) + " CH2: " + String(ecmData.watts[1]);
-    html += "<br>CH3: " + String(ecmData.watts[2]) + " CH4: " + String(ecmData.watts[3]);
-    html += "<br>CH5: " + String(ecmData.watts[4]) + " CH6: " + String(ecmData.watts[5]);
-    html += "<br>CH7: " + String(ecmData.watts[6]);
-    html += "<br><br>Net Watts:<br>CH1: " + String(ecmData.netWatts[0]) + " CH2: " + String(ecmData.netWatts[1]);
-    html += "<br><br>kWh:<br>CH1: " + String(ecmData.kwh[0], 5) + " CH2: " + String(ecmData.kwh[1], 5);
-    html += "<br>CH3: " + String(ecmData.kwh[2], 5) + " CH4: " + String(ecmData.kwh[3], 5);
-    html += "<br>CH5: " + String(ecmData.kwh[4], 5) + " CH6: " + String(ecmData.kwh[5], 5);
-    html += "<br>CH7: " + String(ecmData.kwh[6], 5);
-    html += "<br><br>Delta Wattsec:<br>CH1: " + String(ecmData.deltaWattSeconds[0], 5) + " CH2: " + String(ecmData.deltaWattSeconds[1], 5);
-    html += "<br>CH3: " + String(ecmData.deltaWattSeconds[2], 5) + " CH4: " + String(ecmData.deltaWattSeconds[3], 5);
-    html += "<br>CH5: " + String(ecmData.deltaWattSeconds[4], 5) + " CH6: " + String(ecmData.deltaWattSeconds[5], 5);
-    html += "<br>CH7: " + String(ecmData.deltaWattSeconds[6], 5);
+    html += "<div><form action='/ecm-settings'><h3>ECM Settings</h3>Type is a fine-tune value that increases the sensed value with each tick (255 Max). Range halves the sensed value with each increase.";
+    html += "<label>Settings Retrieved?</label>" + boolToText(ecmSettings.gotSettings, false);
+    html += "<label>Serial Number:</label>" + ecmSettings.serialNumber;
+    html += "<label>Firmware Version:</label>" + String(ecmSettings.firmwareVersion, 4);
+    html += "<label>Packet Send Interval:</label><input name='packet_send' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.sendInterval) + "'> (Max 255)";
+    html += "<label>Channel 1 Config:</label>Type: <input name='ch1type' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ch1Set[0]) + "'> Range: <input class='small' name='ch1range' type='number' min='1' max='255' value='" + String(ecmSettings.ch1Set[1]) + "'>";
+    html += "<label>Channel 2 Config:</label>Type: <input name='ch2type' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ch2Set[0]) + "'> Range: <input class='small' name='ch2range' type='number' min='1' max='255' value='" + String(ecmSettings.ch2Set[1]) + "'>";
+    html += "<label>PT (Voltage) Config:</label>Type: <input name='pttype' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ptSet[0]) + "'>  Range: <input name='ptrange' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ptSet[1]) + "'>";
+    html += "<label>AUX Channel Double:</label>AUX1:  <input type='checkbox' name='aux1x2' " + boolToText(ecmSettings.auxX2[0], true) + "> AUX2: <input type='checkbox' name='aux2x2' " + boolToText(ecmSettings.auxX2[1], true) + "> AUX3: <input type='checkbox' name='aux3x2' " + boolToText(ecmSettings.auxX2[2], true) + "> AUX4:  <input type='checkbox' name='aux4x2' " + boolToText(ecmSettings.auxX2[3], true) + "> AUX5: <input type='checkbox' name='aux5x2' " + boolToText(ecmSettings.auxX2[4], true) + " ><br>";
+    html += "<label>Aux 5 Options:</label>Power: <input name='aux5option' " + aux5Opt(0) + " type='radio' value='0'>  Pulse: <input name='aux5option' " + aux5Opt(1) + " type='radio' value='1'> DC: <input name='aux5option' " + aux5Opt(3) + " type='radio' value='3'>";
+    html += "<button>Update Settings</button></form></div><div id='ecmData'>";
+    html += getECMData();
+    html += "</div><div><a href='/update'>Update Firmware</a></div>";
     html += "</body></html>";
     server.send(200, "text/html", html);
+  }
+}
+
+String aux5Opt(uint8_t opt) {
+  if (ecmSettings.aux5Option == opt) {
+    return "checked='checked'";
+  } else {
+    return "";
+  }
+}
+
+String getECMData() {
+  String html = "<h3>ECM-1240 Data:</h3><br><b>Serial:</b> " + String(ecmData.serialNumber) + "  <b>Voltage:</b> " + String(ecmData.voltage);
+  html += "<br><b>Prev. Seconds:</b> " + String(ecmData.prevSeconds) + " <b>Seconds:</b> " + String(ecmData.seconds);
+  html += "<br><h3>Wattseconds:</h3>CH1: " + String(ecmData.wattSeconds[0]) + " CH2: " + String(ecmData.wattSeconds[1]);
+  html += "<br>CH3: " + String(ecmData.wattSeconds[2]) + " CH4: " + String(ecmData.wattSeconds[3]);
+  html += "<br>CH5: " + String(ecmData.wattSeconds[4]) + " CH6: " + String(ecmData.wattSeconds[5]);
+  html += "<br>CH7: " + String(ecmData.wattSeconds[6]);
+  html += "<br><h3>Prev Wattseconds:</h3>CH1: " + String(ecmData.prevWattSeconds[0]) + " CH2: " + String(ecmData.prevWattSeconds[1]);
+  html += "<br>CH3: " + String(ecmData.prevWattSeconds[2]) + " CH4: " + String(ecmData.prevWattSeconds[3]);
+  html += "<br>CH5: " + String(ecmData.prevWattSeconds[4]) + " CH6: " + String(ecmData.prevWattSeconds[5]);
+  html += "<br>CH7: " + String(ecmData.prevWattSeconds[6]);
+  html += "<br><h3>Polarized Wattseconds:</h3>CH1: " + String(ecmData.polWattSeconds[0]) + " CH2: " + String(ecmData.polWattSeconds[1]);
+  html += "<br><h3>Watts:</h3>CH1: " + String(ecmData.watts[0]) + " CH2: " + String(ecmData.watts[1]);
+  html += "<br>CH3: " + String(ecmData.watts[2]) + " CH4: " + String(ecmData.watts[3]);
+  html += "<br>CH5: " + String(ecmData.watts[4]) + " CH6: " + String(ecmData.watts[5]);
+  html += "<br>CH7: " + String(ecmData.watts[6]);
+  html += "<br><h3>Net Watts:</h3>CH1: " + String(ecmData.netWatts[0]) + " CH2: " + String(ecmData.netWatts[1]);
+  html += "<br><h3>kWh:</h3>CH1: " + String(ecmData.kwh[0], 5) + " CH2: " + String(ecmData.kwh[1], 5);
+  html += "<br>CH3: " + String(ecmData.kwh[2], 5) + " CH4: " + String(ecmData.kwh[3], 5);
+  html += "<br>CH5: " + String(ecmData.kwh[4], 5) + " CH6: " + String(ecmData.kwh[5], 5);
+  html += "<br>CH7: " + String(ecmData.kwh[6], 5);
+  html += "<br><h3>Total kWh (since last boot):</h3>CH1: " + String(ecmData.totalKwh[0], 5) + " CH2: " + String(ecmData.totalKwh[1], 5);
+  html += "<br>CH3: " + String(ecmData.totalKwh[2], 5) + " CH4: " + String(ecmData.totalKwh[3], 5);
+  html += "<br>CH5: " + String(ecmData.totalKwh[4], 5) + " CH6: " + String(ecmData.totalKwh[5], 5);
+  html += "<br>CH7: " + String(ecmData.totalKwh[6], 5);
+  html += "<br><h3>Delta Wattsec:</h3>CH1: " + String(ecmData.deltaWattSeconds[0], 5) + " CH2: " + String(ecmData.deltaWattSeconds[1], 5);
+  html += "<br>CH3: " + String(ecmData.deltaWattSeconds[2], 5) + " CH4: " + String(ecmData.deltaWattSeconds[3], 5);
+  html += "<br>CH5: " + String(ecmData.deltaWattSeconds[4], 5) + " CH6: " + String(ecmData.deltaWattSeconds[5], 5);
+  html += "<br>CH7: " + String(ecmData.deltaWattSeconds[6], 5);
+
+  return html;
+}
+
+String getHTMLHeader(uint8_t pageNum) {
+  String htmlHeader = "<html>";
+  htmlHeader += "<head>";
+  htmlHeader += "<style>";
+  htmlHeader += "body { background-color:#c3c3c3; font-family: Arial, sans-serif; }";
+  htmlHeader += "div { background-color: #fff; border: 1px solid #ccc; box-shadow: 0 2px 2px rgba(0, 0, 0, 0.1); margin: 50px auto; max-width: 400px; padding: 20px; text-align: center; }";
+  htmlHeader += "h1 { margin: 0 0 20px 0; }";
+  htmlHeader += "label { padding-top:5px; display: block; font-size: 16px; font-weight: bold; margin-bottom: 5px; text-align: left; }";
+  htmlHeader += ".full { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding: 10px; width: 100% ; }";
+  htmlHeader += ".small { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding: 10px; width: 100px ; }";
+  htmlHeader += "button { background-color: #4CAF50; border: none; color: #fff; cursor: pointer; font-size: 16px; margin-top: 20px; padding: 10px; width: 100% ; }";
+  htmlHeader += "button:hover { background-color: #45a049; }";
+  htmlHeader += "p.error { color: #f00; font-size: 14px; margin: 10px 0; text-align: left; }";
+  htmlHeader += "</style>";
+
+  if (pageNum == 1) {
+    htmlHeader += "<script>";
+    htmlHeader += "function updateDiv() {";
+    htmlHeader += "const xhr = new XMLHttpRequest();";
+    htmlHeader += "xhr.onreadystatechange = function() {";
+    htmlHeader += "if (this.readyState === 4 && this.status === 200) {";
+    htmlHeader += "document.getElementById(\"ecmData\").innerHTML = this.responseText;";
+    htmlHeader += "  }";
+    htmlHeader += "};";
+    htmlHeader += "xhr.open(\"GET\", \"/ecm-data\");";
+    htmlHeader += "xhr.send();";
+    htmlHeader += "}";
+    htmlHeader += "setInterval(updateDiv, 5000);";
+    htmlHeader += "</script>";
+  }
+
+  htmlHeader += "</head>";
+  htmlHeader += "<body>";
+
+  return htmlHeader;
+}
+
+void handleECMData() {
+  server.send(200, "text/html", getECMData());
+}
+
+void handleECMSettings() {
+  uint8_t packet_send = server.arg("packet_send").toInt();
+  uint8_t ch1type = server.arg("ch1type").toInt();
+  uint8_t ch1range = server.arg("ch1range").toInt();
+  uint8_t ch2type = server.arg("ch2type").toInt();
+  uint8_t ch2range = server.arg("ch2range").toInt();
+  uint8_t pttype = server.arg("pttype").toInt();
+  uint8_t ptrange = server.arg("ptrange").toInt();
+  bool auxX2[5] = { server.arg("aux1x2").equals("on"), server.arg("aux2x2").equals("on"), server.arg("aux3x2").equals("on"), server.arg("aux4x2").equals("on"), server.arg("aux5x2").equals("on") };
+  uint8_t aux5Option = server.arg("aux5option").toInt();
+  double fwVer = (double)ecmSettings.firmwareVersion;
+  String sendSettings = "";
+
+  bool auxChange = false;
+
+  uint8_t aux5Bits = 0;
+  int i = 0;
+
+  for (i; i < 5; i++) {
+    if (auxX2[i]) {
+      aux5Bits |= 1 << i;
+    }
+
+    if (auxX2[i] != ecmSettings.auxX2[i]) {
+      auxChange = true;
+    }
+  }
+
+  if (aux5Option == 1) {
+    aux5Bits |= 1 << i;
+  } else if (aux5Option == 3) {
+    aux5Bits |= 1 << ++i;
+  }
+
+  if (aux5Option != ecmSettings.aux5Option) {
+    auxChange = true;
+  }
+
+  int aux5Value = aux5Bits;
+
+  Serial.println(aux5Value);
+
+  // Generate the HTML page with the variable values
+  String html = getHTMLHeader(0) + "<div><h3>Settings saved.</h3>Click <a href='/main'>here</a> to return to the settings page.</div>";
+  html += "</body></html>";
+
+  byte data = 0xFC;  // binary 0xFC
+  if (fwVer > 1.031) {
+    if (packet_send != ecmSettings.sendInterval || ch1type != ecmSettings.ch1Set[0] || ch1range != ecmSettings.ch1Set[1] || ch2type != ecmSettings.ch2Set[0] || ch2range != ecmSettings.ch2Set[1] || pttype != ecmSettings.ptSet[0] || ptrange != ecmSettings.ptSet[1]) {
+      sendSettings = "SETALL1," + zeroPad(String(ch1type), 3) + ",";
+      sendSettings += zeroPad(String(ch1range), 3) + ",";
+      sendSettings += zeroPad(String(ch2type), 3) + ",";
+      sendSettings += zeroPad(String(ch2range), 3) + ",";
+      sendSettings += zeroPad(String(pttype), 3) + ",";
+      sendSettings += zeroPad(String(ptrange), 3) + ",";
+      sendSettings += zeroPad(String(aux5Value), 3) + ",";
+      sendSettings += zeroPad(String(packet_send), 3);
+      html += "<br><br><br>SETALL" + sendSettings;
+      Serial.write(data);
+      delay(50);
+      Serial.write(sendSettings.c_str());
+    }
+  } else {
+    if (packet_send != ecmSettings.sendInterval) {
+      Serial.write(data);
+      delay(50);
+      Serial.write("SET");
+      delay(50);
+      Serial.write("IV2");
+      delay(50);
+      Serial.write((char)packet_send);
+      delay(50);
+    }
+
+    if (ch1type != ecmSettings.ch1Set[0] || ch1range != ecmSettings.ch1Set[1]) {
+      Serial.write(data);
+      delay(50);
+      Serial.write("SET");
+      delay(50);
+      Serial.write("CT1");
+      delay(50);
+      Serial.write("TYP");
+      delay(50);
+      Serial.write((char)ch1type);
+      delay(50);
+      Serial.write("RNG");
+      delay(50);
+      Serial.write((char)ch1range);
+      delay(50);
+    }
+
+    if (ch2type != ecmSettings.ch2Set[0] || ch2range != ecmSettings.ch2Set[1]) {
+      Serial.write(data);
+      delay(50);
+      Serial.write("SET");
+      delay(50);
+      Serial.write("CT2");
+      delay(50);
+      Serial.write("TYP");
+      delay(50);
+      Serial.write((char)ch2type);
+      delay(50);
+      Serial.write("RNG");
+      delay(50);
+      Serial.write((char)ch2range);
+      delay(50);
+    }
+
+    if (pttype != ecmSettings.ptSet[0] || ptrange != ecmSettings.ptSet[1]) {
+      Serial.write(data);
+      delay(50);
+      Serial.write("SET");
+      delay(50);
+      Serial.write("PTT");
+      delay(50);
+      Serial.write((char)pttype);
+      delay(50);
+      Serial.write("PTR");
+      delay(50);
+      Serial.write((char)ptrange);
+      delay(50);
+    }
+
+    if (auxChange) {
+      Serial.write(data);
+      delay(50);
+      Serial.write("SET");
+      delay(50);
+      Serial.write("OPT");
+      delay(50);
+      Serial.write((char)aux5Value);
+    }
+  }
+
+  server.send(200, "text/html", html);
+}
+
+String boolToText(bool check, bool input) {
+  if (check) {
+    if (!input) {
+      return "True";
+    } else {
+      return "checked='checked'";
+    }
+  } else {
+    if (!input) {
+      return "False";
+    } else {
+      return "";
+    }
   }
 }
 
@@ -510,15 +851,12 @@ void handleRoot() {
 
 void sendLogin(bool error) {
   // Send the login HTML page if not authenticated
-  String html = "<!DOCTYPE html><html><head><title>Login</title>";
-  html += css;
-  html += "</head> <body> <div class='login'> <h1> Login</h1>";
-
+  String html = getHTMLHeader(0) + "<div>";
 
   if (error) {
     html += "<p class='error'>Invalid username or password.</p>";
   }
-  html += "<form action='/login' method='post'> <label for='username'>Username:</label> <input type='text' id='username' name='username'> <label for='password'>Password:</label> <input type='password' id='password' name='password'> <button type='submit'>Login</button> </form> </div> </body> </html>";
+  html += "<form action='/login' method='post'> <label for='username'>Username:</label> <input class='full' type='text' id='username' name='username'> <label for='password'>Password:</label> <input class='full' type='password' id='password' name='password'> <button type='submit'>Login</button> </form> </div> </body> </html>";
   server.send(200, "text/html", html);
 }
 
@@ -529,7 +867,7 @@ void handleLogin() {
   // Replace with your authentication logic
   if (username == loginUser && password == loginPass) {
     // Set the session cookie and redirect to the dashboard page
-    server.sendHeader("Set-Cookie", "session_id=1; HttpOnly");
+    server.sendHeader("Set-Cookie", "session_id=1; Max-Age=7200; HttpOnly");
     server.sendHeader("Location", "/main");
     server.send(302);
   } else {
@@ -544,7 +882,7 @@ void handleSerialToTcp() {
   int port = server.arg("port").toInt();
   IPAddress ipStore;
 
-  String html = "<html><body>";
+  String html = getHTMLHeader(0);
 
   // Error test the client connection
   if (ipStore.fromString(ip) && port > 1024 && port < 65536) {
@@ -585,7 +923,7 @@ void handleSerialToTcpServer() {
   // Serial to TCP client connection
   int port = server.arg("port").toInt();
 
-  String html = "<html><body>";
+  String html = getHTMLHeader(0);
 
   // Error test the client connection
   if (port > 1024 && port < 65536) {
@@ -614,7 +952,7 @@ void handleMqtt() {
   String pass = server.arg("pass");
   int port = server.arg("port").toInt();
 
-  String html = "<html><body>";
+  String html = getHTMLHeader(0);
 
   // Error test the client connection
   if (port > 1024 && port < 65536) {
@@ -630,9 +968,15 @@ void handleMqtt() {
     mqttUser = user;
     mqttPass = pass;
 
-    html += "<h2>Address: " + mqttServer + " Port: " + String(port) + " User: " + String(mqttUser) + " Pass:  " + String(mqttPass) + " saved to EEPROM.</h2>";
+
+    html += "<div><h3>Address: " + mqttServer + " Port: " + String(port) + " User: " + String(mqttUser) + " Pass:  " + String(mqttPass) + " saved to EEPROM.</h3></div>";
+    if (!mqttClient.connect(mqttClientID.c_str(), mqttUser.c_str(), mqttPass.c_str())) {
+      html += "<div><h3>MQTT couldn't connect, please check your settings.</h3></div>";
+    } else {
+      mqttClient.disconnect();
+    }
   } else {
-    html += "<h2>Invalid IP Address or Port</h2>";
+    html += "<div><h3>Invalid Port</h3></div>";
   }
 
   html += "</body></html>";
@@ -644,7 +988,7 @@ void handleLoginSettings() {
   String user = server.arg("user");
   String pass = server.arg("pass");
 
-  String html = "<html><body>";
+  String html = getHTMLHeader(0);
 
   storeString(user, loginUserAddress);
   storeString(pass, loginPassAddress);
@@ -652,7 +996,9 @@ void handleLoginSettings() {
   loginUser = user;
   loginPass = pass;
 
-  html += " User: " + String(loginUser) + " Pass:  " + String(loginPass) + " saved to EEPROM.</h2></body></html>";
+  httpUpdater.setup(&server, loginUser, loginPass);
+
+  html += "<div><h3>User: " + String(loginUser) + " Pass:  " + String(loginPass) + " saved to EEPROM.</h3></div></body></html>";
 
   server.send(200, "text/html", html);
 }
@@ -663,6 +1009,7 @@ void storeString(String store, int location) {
   }
 
   EEPROM.write(location, '\0');  // add null terminator to end of string
+  EEPROM.commit();
 }
 
 String getString(int location) {
@@ -674,6 +1021,13 @@ String getString(int location) {
   }
 
   return readString.c_str();
+}
+
+String zeroPad(String str, int desiredLength) {
+  while (str.length() < desiredLength) {
+    str = "0" + str;
+  }
+  return str;
 }
 
 bool isValidIP(String str) {
