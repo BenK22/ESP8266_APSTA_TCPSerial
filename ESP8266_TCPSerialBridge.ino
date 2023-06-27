@@ -6,7 +6,7 @@
 #include <ESP8266HTTPUpdateServer.h>
 #include <Ticker.h>
 
-const String ver = "v1.0";
+const String ver = "v1.2";
 
 struct DeviceData {
   double voltage = 0.0;
@@ -92,14 +92,14 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 PubSubClient mqttClient(clientTwo);
 
-String tcpIp = "";
+IPAddress tcpIP = IPAddress(0, 0, 0, 0);
 int tcpPort = 0;
 
 int tcpServerPort = 8000;
 WiFiServer ecmServer(5555);
 int baud = 19200;
 
-String mqttServer = "";
+IPAddress mqttServer = IPAddress(0, 0, 0, 0);
 String mqttUser = "";
 String mqttPass = "";
 String mqttClientID = "";
@@ -146,6 +146,8 @@ void setup() {
 
   WiFi.macAddress(mac);
 
+  mqttClientID = String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
+
   // Start EEPROM
   EEPROM.begin(eepromSize);
 
@@ -185,22 +187,12 @@ void setup() {
   Serial.flush();
   Serial.setTimeout(300);
 
-  for (int i = 0; i < 4; i++) {
-    // Read each byte of the IP address from EEPROM
-    byte b = EEPROM.read(tcpIPAddress + i);
-    // Add the byte to the IP string
-    tcpIp += String(b);
-    if (i < 3) {
-      // Add the dot separator between bytes
-      tcpIp += ".";
-    }
-  }
-
+  tcpIP = getIP(tcpIPAddress);
+  mqttServer = getIP(mqttServerAddress);
 
   loginUser = getString(loginUserAddress);
   loginPass = getString(loginPassAddress);
 
-  mqttServer = getString(mqttServerAddress);
   mqttUser = getString(mqttUserAddress);
   mqttPass = getString(mqttPassAddress);
 
@@ -210,7 +202,7 @@ void setup() {
   EEPROM.get(tcpServerPortAddress, tcpServerPort);
 
   // Connect to saved network
-  if (strcmp(ssid, "") != 0 && strcmp(password, "") != 0) {
+  if (strcmp(ssid, "") != 0 && strcmp(password, "") != 0 && WiFi.status() != WL_CONNECTED) {
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
 
@@ -219,7 +211,7 @@ void setup() {
     while (WiFi.status() != WL_CONNECTED) {
       delay(1000);
 
-      if (x > 20) {
+      if (x > 5) {
         break;
       }
 
@@ -294,6 +286,24 @@ void resetMemory() {
 }
 
 void loop() {
+  // Connect to saved network
+  if (strcmp(ssid, "") != 0 && strcmp(password, "") != 0 && WiFi.status() != WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+
+    int x = 0;
+
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(1000);
+
+      if (x > 5) {
+        break;
+      }
+
+      x++;
+    }
+  }
+
   MDNS.update();
   server.handleClient();
   startTime = micros();
@@ -313,6 +323,8 @@ void loop() {
         dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
         ecmClient.write(buffer, dataLength);  // Send the entire buffer to the server
+
+        handlePacket();
       }
     }
 
@@ -333,16 +345,14 @@ void loop() {
       Serial.write(buffer, dataLength);  // Send the entire buffer to the ECM-1240
     }
   } else {
-    if (!client.connected() && isValidIP(tcpIp) && tcpPort > 1024 && tcpPort < 65536) {
-      client.connect(tcpIp.c_str(), tcpPort);
+    if (!client.connected() && tcpIP.isSet() && tcpPort > 1024 && tcpPort < 65536) {
+      client.connect(tcpIP, tcpPort);
       client.setTimeout(100);
-    } else {
-      if (Serial.available()) {
-        dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
-
-        handlePacket();
-      }
     }
+
+    dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
+
+    handlePacket();
   }
 
   delay(10);
@@ -503,8 +513,8 @@ String serialDebug() {
 }
 
 void mqttPost() {
-  if (WiFi.status() == WL_CONNECTED) {
-    mqttClient.setServer(mqttServer.c_str(), mqttPort);
+  if (WiFi.status() == WL_CONNECTED && mqttServer.isSet()) {
+    mqttClient.setServer(mqttServer, mqttPort);
 
     String deviceName = "ECM1240-";
     uint8_t numChan = 7;
@@ -512,10 +522,6 @@ void mqttPost() {
     if (deviceType == 2) {
       deviceName = "GEM-";
       numChan = 32;
-    }
-
-    if (mqttClientID == "") {
-      mqttClientID = deviceName + String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
     }
 
     if (!mqttClient.connect(mqttClientID.c_str(), mqttUser.c_str(), mqttPass.c_str())) {
@@ -553,10 +559,10 @@ void mqttPost() {
 }
 
 void handleHA() {
-  if (WiFi.status() == WL_CONNECTED) {
-    mqttClient.setServer(mqttServer.c_str(), mqttPort);
+  String html = getHTMLHeader(0);
+  if (WiFi.status() == WL_CONNECTED && mqttServer.isSet()) {
+    mqttClient.setServer(mqttServer, mqttPort);
 
-    String html = getHTMLHeader(0);
 
     String deviceName = "ECM1240-";
     uint8_t numChan = 7;
@@ -564,10 +570,6 @@ void handleHA() {
     if (deviceType == 2) {
       deviceName = "GEM-";
       numChan = 32;
-    }
-
-    if (mqttClientID == "") {
-      mqttClientID = deviceName + String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
     }
 
     if (!mqttClient.connect(mqttClientID.c_str(), mqttUser.c_str(), mqttPass.c_str())) {
@@ -647,8 +649,10 @@ void handleHA() {
 
     mqttClient.disconnect();
     html += "</div></body></html>";
-    server.send(200, "text/html", html);
+  } else {
+    html += "<div><h3>MQTT couldn't connect, please check your settings.</h3></div></html></body>";
   }
+  server.send(200, "text/html", html);
 }
 
 void handleAP() {
@@ -820,8 +824,8 @@ void handleStationMode() {
     html += "><button class='button'>Save Baudrate</button>";
     html += "</form></div>";
     html += "<div><form action='/serial-to-tcp'><h3>Serial to TCP Client</h3>";
-    html += "<label>IP address:</label><input class='full' type='text' name='ip' value=''>";
-    html += "<label>Port:</label><input class='full' type='number' name='port' value=''>";
+    html += "<label>IP address:</label><input class='full' type='text' name='ip' value='" + tcpIP.toString() + "'>";
+    html += "<label>Port:</label><input class='full' type='number' name='port' value='" + String(tcpPort) + "'>";
     html += "<button class='button'>Connect</button>";
     html += "</form></div>";
     html += "<div><form action='/serial-to-tcp-server'><h3>TCP Server Connection</h3>";
@@ -829,7 +833,7 @@ void handleStationMode() {
     html += "<button class='button'>Save</button>";
     html += "</form></div>";
     html += "<div><form action='/mqtt'><h3>MQTT Server Connection</h3>";
-    html += "<label>IP address/Domain:</label><input class='full' type='text' name='ip' value='" + String(mqttServer) + "'>";
+    html += "<label>IP address/Domain:</label><input class='full' type='text' name='ip' value='" + mqttServer.toString() + "'>";
     html += "<label>Port:</label><input class='full' type='number' name='port' value='" + String(mqttPort) + "'>";
     html += "<label>User:</label><input class='full' type='text' name='user' value='" + String(mqttUser) + "'>";
     html += "<label>Password:</label><input class='full' type='password' name='pass' value=''>";
@@ -1264,32 +1268,28 @@ void handleLogin() {
 
 void handleSerialToTcp() {
   // Serial to TCP client connection
-  String ip = server.arg("ip");
+  IPAddress ip;
   int port = server.arg("port").toInt();
   IPAddress ipStore;
 
   String html = getHTMLHeader(0);
 
   // Error test the client connection
-  if (ipStore.fromString(ip) && port > 1024 && port < 65536) {
+  if (ip.fromString(server.arg("ip")) && port > 1024 && port < 65536) {
 
-    // Store in EEPROM
-    for (int i = 0; i < 4; i++) {
-      EEPROM.write(tcpIPAddress + i, ipStore[i]);
-    }
-
+    storeIP(tcpIPAddress, ip);
     EEPROM.put(tcpPortAddress, port);
     EEPROM.commit();
 
-    tcpIp = ip;
+    tcpIP = ip;
     tcpPort = port;
 
-    html += "<h2>IP: " + ip + " Port: " + port + " saved to EEPROM.  Starting server...</h2>";
+    html += "<h2>IP: " + ip.toString() + " Port: " + port + " saved to EEPROM.  Starting server...</h2>";
 
     if (client.connected()) {
       client.stop();
 
-      if (client.connect(tcpIp.c_str(), tcpPort)) {
+      if (client.connect(tcpIP, tcpPort)) {
         client.setTimeout(100);
         html += "<h5>Connected to TCP server</h5>";
       } else {
@@ -1297,6 +1297,9 @@ void handleSerialToTcp() {
       }
     }
 
+  } else if (server.arg("ip") == "") {
+    tcpIP = IPAddress(0, 0, 0, 0);
+    storeIP(tcpIPAddress, IPAddress(0, 0, 0, 0));
   } else {
     html += "<h2>Invalid IP Address or Port</h2>";
   }
@@ -1333,7 +1336,7 @@ void handleSerialToTcpServer() {
 
 void handleMqtt() {
   // Serial to TCP client connection
-  String ip = server.arg("ip");
+  IPAddress ip;
   String user = server.arg("user");
   String pass = server.arg("pass");
   int port = server.arg("port").toInt();
@@ -1341,11 +1344,11 @@ void handleMqtt() {
   String html = getHTMLHeader(0);
 
   // Error test the client connection
-  if (port > 1024 && port < 65536) {
-    storeString(ip, mqttServerAddress);
+  if (port > 1024 && port < 65536 && ip.fromString(server.arg("ip"))) {
     storeString(user, mqttUserAddress);
     storeString(pass, mqttPassAddress);
 
+    storeIP(mqttServerAddress, ip);
     EEPROM.put(mqttPortAddress, port);
     EEPROM.commit();
 
@@ -1354,15 +1357,21 @@ void handleMqtt() {
     mqttUser = user;
     mqttPass = pass;
 
+    mqttClient.disconnect();
 
-    html += "<div><h3>Address: " + mqttServer + " Port: " + String(port) + " User: " + String(mqttUser) + " Pass:  " + String(mqttPass) + " saved to EEPROM.</h3></div>";
+    mqttClient.setServer(mqttServer, mqttPort);
+
+    html += "<div><h3>Address: " + mqttServer.toString() + " Port: " + String(port) + " User: " + String(mqttUser) + " Pass:  " + String(mqttPass) + " saved to EEPROM.</h3></div>";
     if (!mqttClient.connect(mqttClientID.c_str(), mqttUser.c_str(), mqttPass.c_str())) {
       html += "<div><h3>MQTT couldn't connect, please check your settings.</h3></div>";
     } else {
       mqttClient.disconnect();
     }
+  } else if (server.arg("ip") == "") {
+    mqttServer = IPAddress(0, 0, 0, 0);
+    storeIP(mqttServerAddress, IPAddress(0, 0, 0, 0));
   } else {
-    html += "<div><h3>Invalid Port</h3></div>";
+    html += "<h2>Invalid IP Address or Port</h2>";
   }
 
   html += "</body></html>";
@@ -1449,6 +1458,14 @@ void storeString(String store, int location) {
   EEPROM.commit();
 }
 
+void storeIP(int addressOffset, const IPAddress& ip) {
+  for (int i = 0; i < 4; i++) {
+    EEPROM.write(addressOffset + i, ip[i]);
+  }
+
+  EEPROM.commit();
+}
+
 String getString(int location) {
   String readString = "";
   char c = EEPROM.read(location++);
@@ -1467,11 +1484,6 @@ String zeroPad(String str, int desiredLength) {
   return str;
 }
 
-bool isValidIP(String str) {
-  IPAddress ipCheck;
-  return ipCheck.fromString(str);
-}
-
 bool isAuthenticated() {
   if (loginUser != "" && loginPass != "") {
     // Check if the session cookie is set and valid
@@ -1484,5 +1496,18 @@ bool isAuthenticated() {
     }
   } else {
     return true;
+  }
+}
+
+IPAddress getIP(int location) {
+  uint8_t storedIPBytes[4];
+  for (int i = 0; i < 4; i++) {
+    storedIPBytes[i] = EEPROM.read(location + i);
+  }
+
+  if (IPAddress(storedIPBytes).isSet()) {
+    return IPAddress(storedIPBytes);
+  } else {
+    return IPAddress(0, 0, 0, 0);
   }
 }
