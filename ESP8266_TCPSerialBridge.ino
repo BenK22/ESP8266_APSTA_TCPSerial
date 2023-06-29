@@ -85,6 +85,8 @@ struct IPAddressConfig {
   IPAddress dns2 = IPAddress(8, 8, 4, 4);  // DNS server 2
 };
 
+IPAddressConfig storedIPConfig;
+
 WiFiClient client;
 WiFiClient clientTwo;
 
@@ -148,6 +150,8 @@ void setup() {
 
   mqttClientID = String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
 
+  WiFi.hostname("Brultech-" + mqttClientID);
+
   // Start EEPROM
   EEPROM.begin(eepromSize);
 
@@ -164,7 +168,6 @@ void setup() {
   EEPROM.get(baudAddress, baud);
 
   // Read the stored IP address configuration
-  IPAddressConfig storedIPConfig;
   EEPROM.get(ipConfigAddress, storedIPConfig);
 
   // Check if configuration is stored
@@ -244,8 +247,7 @@ void setup() {
     server.on("/data", handleData);
     server.on("/serial-debug", handleSerialDebug);
     server.on("/reboot", handleReboot);
-    //server.on("/update", HTTP_POST, handleUpdate);
-    MDNS.begin("esp8266");
+    MDNS.begin("brultechesp");
     delay(1000);
   }
 
@@ -787,10 +789,10 @@ void handleStationMode() {
     getDeviceSettings();
     // Station mode webpage
     String html = getHTMLHeader(1);
-    html += "<div><form action='/config'><h3>Brultech Config " + ver + "</h3></div>";
+    html += "<div><h3>Brultech Config " + ver + "</h3></div>";
     html += "<div><form action='/config'><h3>Network Settings</h3>";
     html += "<h4>Connected to: " + String(WiFi.SSID()) + "</h4>";
-    html += "<label>Select a network: <select name='ssid'>";
+    html += "<label>Select a network:</label> <select name='ssid'>";
     int networksFound = WiFi.scanNetworks();
     for (int i = 0; i < networksFound; i++) {
       html += "<option value='" + String(WiFi.SSID(i)) + "'>" + String(WiFi.SSID(i)) + "</option>";
@@ -801,6 +803,15 @@ void handleStationMode() {
     html += "<button class='button'>Submit</button>";
     html += "</form></div>";
     html += "<div><form action='/ip-config'><h3>IP Address Settings</h3>";
+    html += "<label>Type:</label>DHCP: <input name='type' type='radio' ";
+    if (!storedIPConfig.isConfigured) {
+      html += "checked='checked'";
+    }
+    html += " value='0'>  Static: <input name='type' type='radio' ";
+    if (storedIPConfig.isConfigured) {
+      html += "checked='checked'";
+    }
+    html += " value='1'>";
     html += "<label>IP address:</label><input class='full' type='text' name='ip' value='" + WiFi.localIP().toString() + "'>";
     html += "<label>Subnet:</label><input class='full' type='text' name='subnet' value='" + WiFi.subnetMask().toString() + "'>";
     html += "<label>Gateway:</label><input class='full' type='text' name='gateway' value='" + WiFi.gatewayIP().toString() + "'>";
@@ -1014,8 +1025,8 @@ String getData() {
 }
 
 String getHTMLHeader(uint8_t pageNum) {
-  String htmlHeader = "<html>";
-  htmlHeader += "<head>";
+  String htmlHeader = "<!DOCTYPE html lang='en'>";
+  htmlHeader += "<head><title>Brultech ESP-8266 Setup</title>";
   htmlHeader += "<style>";
   htmlHeader += "body { background-color:#c3c3c3; font-family: Arial, sans-serif; }";
   htmlHeader += "div { background-color: #fff; border: 1px solid #ccc; box-shadow: 0 2px 2px rgba(0, 0, 0, 0.1); margin: 50px auto; max-width: 400px; padding: 20px; text-align: center; }";
@@ -1406,26 +1417,48 @@ void handleBaud() {
 
 void handleIPConfig() {
   IPAddressConfig config;
+  uint8_t type = server.arg("type").toInt();
   String html = getHTMLHeader(0);
 
   // Parse form data and validate IP settings
-  if (config.ip.fromString(server.arg("ip")) && config.subnet.fromString(server.arg("subnet")) && config.gateway.fromString(server.arg("gateway")) && config.dns1.fromString(server.arg("dns1")) && config.dns2.fromString(server.arg("dns2"))) {
-    config.isConfigured = true;
+  if (type == 1) {
+    if (config.ip.fromString(server.arg("ip")) && config.subnet.fromString(server.arg("subnet")) && config.gateway.fromString(server.arg("gateway")) && config.dns1.fromString(server.arg("dns1")) && config.dns2.fromString(server.arg("dns2"))) {
+      config.isConfigured = true;
+
+      // Write the IP settings structure to EEPROM
+      EEPROM.put(ipConfigAddress, config);
+
+      EEPROM.commit();  // Save changes to EEPROM
+
+      storedIPConfig = config;
+
+      html += "<div><h3>IP settings saved, click <a href='http://" + config.ip.toString() + "/'>here</a> to access the unit.<br><br>If you can't access the module afterwards it can be reset by using the push button.</h3></div></body></html>";
+
+      server.send(200, "text/html", html);
+
+      delay(500);
+
+      WiFi.config(config.ip, config.gateway, config.subnet, config.dns1, config.dns2);
+    } else {
+      html += "<div><h3>Invalid IP Address, Subnet, Gateway, or DNS.</h3></div></body></html>";
+
+      server.send(200, "text/html", html);
+    }
+  } else {
+    storedIPConfig.isConfigured = false;
 
     // Write the IP settings structure to EEPROM
-    EEPROM.put(ipConfigAddress, config);
+    EEPROM.put(ipConfigAddress, storedIPConfig);
 
     EEPROM.commit();  // Save changes to EEPROM
 
-    html += "<div><h3>IP settings saved, click <a href='http://" + config.ip.toString() + "/'>here</a> to access the unit.<br>If you can't access the module afterwards it can be reset by using the push button.</h3></div></body></html>";
+    html += "<div><h3>IP settings changed to DHCP, click <a href='http://brultechesp.local/'>here</a> to access the unit.<br><br>If you can't access the module afterwards it can be reset by using the push button.</h3></div></body></html>";
 
     server.send(200, "text/html", html);
 
-    WiFi.config(config.ip, config.gateway, config.subnet, config.dns1, config.dns2);
-  } else {
-    html += "<div><h3>Invalid IP Address, Subnet, Gateway, or DNS.</h3></div></body></html>";
+    delay(500);
 
-    server.send(200, "text/html", html);
+    WiFi.config(0, 0, 0);
   }
 }
 
