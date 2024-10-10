@@ -11,18 +11,20 @@
 
 #define LEAP_YEAR(Y) ((Y > 0) && !(Y % 4) && ((Y % 100) || !(Y % 400)))
 
-const String ver = "v1.99a";
+const String ver = "v1.99c";
 
 // EEPROM memory locations
 const int eepromSize = 4096;
 const int ssidAddress = 0;
+
+// old address
 const int passwordAddress = 32;
 const int isFirstRunAddress = 64;
 const int tcpPortAddress = 65;
 const int tcpIPAddress = 69;
 const int tcpServerPortAddress = 89;
-const int mqttPortAddress = 109;
-const int mqttServerAddress = 129;
+const int mqttServerAddress = 109;
+const int mqttPortAddress = 129;
 const int mqttUserAddress = 131;
 const int mqttPassAddress = 151;
 const int loginUserAddress = 171;
@@ -31,9 +33,11 @@ const int baudAddress = 211;
 const int ipConfigAddress = 216;
 const int mqttDataAddress = 233;
 const int ntpServerAddress = 982;
-const int idleTimeAddress = 1000;
+
+//  shifted password location for legacy units, older F/W did not support full passwords
 const int isNewPasswordAddress = 1001;
 const int newPasswordAddress = 1002;
+const int idleTimeAddress = 1069;
 
 
 
@@ -51,12 +55,12 @@ IPAddress mqttServer = IPAddress(0, 0, 0, 0);
 char mqttUser[20] = {};
 char mqttPass[20] = {};
 char mqttClientID[20] = {};
-int mqttPort = 1883;
+uint16_t mqttPort = 1883;
 MqttData mqttData;
 
 
 // UDP config
-const int udpPort = 48925;
+const uint16_t udpPort = 48925;
 WiFiUDP UDP;
 char udpPacket[255];
 String udpResponse;
@@ -66,7 +70,7 @@ StaticJsonDocument<128> doc;
 
 // WiFi config
 char ssid[32] = "";
-char password[64] = "";
+char password[65] = "";
 String apName = "Brultech-";
 char apPassword[9] = "brultech";
 bool inAP = false;
@@ -144,9 +148,9 @@ char loginPass[20] = "";
 // TCP Client/Server
 WiFiClient tcpClient;
 IPAddress tcpIP = IPAddress(0, 0, 0, 0);
-int tcpPort = 0;
+uint16_t tcpPort = 0;
 
-int tcpServerPort = 8000;
+uint16_t tcpServerPort = 8000;
 WiFiServer ecmServer(5555);
 
 
@@ -157,7 +161,9 @@ const char* headerkeys[] = { "User-Agent", "Cookie", "Content-Type", "Content-Le
 size_t headerkeyssize = sizeof(headerkeys) / sizeof(char*);
 uint8_t mac[6];
 bool resetFlag = false;
-uint8_t idleTime = 5;
+uint16_t idleTime = 5;
+
+String debugText = "";
 
 char ntpServer[40] = "pool.ntp.org";
 WiFiUDP ntpUDP;
@@ -327,6 +333,7 @@ void setupWiFi() {
       tickerSTA.attach(0.5, toggleLED);  // Start the thread
       WiFi.mode(WIFI_STA);
       WiFi.begin(ssid, password);
+      inAP = false;
 
       int x = 0;
 
@@ -341,8 +348,7 @@ void setupWiFi() {
       }
 
       if (WiFi.status() == WL_CONNECTED) {
-        tickerSTA.detach();  // Stop the ticker
-        inAP = false;
+        tickerSTA.detach();          // Stop the ticker
         digitalWrite(LED_PIN, LOW);  // Turn off the LED
 
         MDNS.begin(localAddress);
@@ -389,6 +395,8 @@ void setupWebServer() {
   server.on("/login", handleLogin);
   server.on("/main", handleStationMode);
   server.on("/config", handleConfig);
+  server.on("/start-real", handleStartReal);
+  server.on("/stop-real", handleStopReal);
   server.on("/login-settings", handleLoginSettings);
   server.on("/serial-to-tcp", handleSerialToTcp);
   server.on("/ecm-settings", handleECMSettings);
@@ -560,7 +568,7 @@ void loop() {
             if (strcmp(doc["type"], "btech") == 0) {
               if (strcmp(doc["cmd"], "req") == 0) {
                 // Send response packet
-                udpResponse = "{\"type\":\"" + deviceName + "-" + "esp8266-" + mqttClientID + "\", \"ip\":\"" + WiFi.localIP().toString() + "\"}";
+                udpResponse = "{\"type\":\"" + deviceData.serialNumber + "-" + "esp8266-" + mqttClientID + "\", \"ip\":\"" + WiFi.localIP().toString() + "\"}";
 
                 char charArray[udpResponse.length() + 1];
                 udpResponse.toCharArray(charArray, udpResponse.length() + 1);
@@ -1129,7 +1137,7 @@ void handleAP() {
     }
     html += "</select><br>";
     html += "<label>Or enter SSID:</label> <input id='custom_ssid' class='full' type='text' name='custom_ssid'><br>";
-    html += "<label>Password:</label> <input class='full' type='password' name='password'><br>";
+    html += "<label>Password:</label> <input class='full' maxlength='64' type='password' name='password' value=''><br>";
     html += "<button id='saveLocal' class='button'>Connect to Network</button>";
     html += "</form></div><div>Local address will be copied to clipboard upon clicking connect.<br><br> <a id='localLink' href='http://" + localAddress + ".local/'>http://" + localAddress + ".local/</a></div>";
     html += "<div>Click below to access the configuration page.<br><br> <a href='http://192.168.4.1/main'>Configuration Page</a></div>";
@@ -1152,7 +1160,7 @@ void handleConfig() {
   String passwordValue = server.arg("password");
 
   ssidValue.toCharArray(ssid, 32);
-  passwordValue.toCharArray(password, 32);
+  passwordValue.toCharArray(password, 64);
 
   EEPROM.put(ssidAddress, ssid);
   EEPROM.put(newPasswordAddress, password);
@@ -1174,20 +1182,24 @@ void getDeviceSettings() {
 
   deviceType = 3;
 
-  if(baud == 19200) {
+  if (baud == 19200) {
     byte data = 0xFC;  // binary 0xFC
     Serial.write(data);
+    delay(50);
+    Serial.write("SET");
     delay(100);
-    Serial.write("SETRCV");
-    delay(100);
+    Serial.write("RCV");
+    delay(50);
 
     if (Serial.available()) {
       dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
       if (dataLength > 32) {
+        debugText = "Success " + String(buffer) + " " + String(dataLength);
         deviceType = 1;
         processECMSettings();
       } else {
+        debugText = String(buffer) + " " + String(dataLength);
         tryGEM = true;
       }
     } else {
@@ -1263,33 +1275,61 @@ void getDeviceSettingsChangeBaud() {
 }
 
 void processECMSettings() {
+  bool process = false;
+  int i = 0;
+
+  for (i = 0; i < 5; i++) {
+    if (buffer[i] == 0xFC) {
+      process = true;
+      break;
+    }
+  }
+
+  i = i + 3;
+
   // Validate the first three bytes and last 2 bytes
-  if (buffer[0] == 0xFC && buffer[1] == 0xFC && buffer[2] == 0xFC) {
+  if (process) {
     // Extract the voltage value as an unsigned integer
     ecmSettings.gotSettings = true;
 
-    ecmSettings.ch1Set[0] = (uint8_t)buffer[3];
-    ecmSettings.ch1Set[1] = (uint8_t)buffer[4];
+    ecmSettings.ch1Set[0] = (uint8_t)buffer[i++];
+    debugText += " " + String(i);
+    ecmSettings.ch1Set[1] = (uint8_t)buffer[i++];
+    debugText += " " + String(i);
 
-    ecmSettings.ch2Set[0] = (uint8_t)buffer[5];
-    ecmSettings.ch2Set[1] = (uint8_t)buffer[6];
+    ecmSettings.ch2Set[0] = (uint8_t)buffer[i++];
+    debugText += " " + String(i);
+    ecmSettings.ch2Set[1] = (uint8_t)buffer[i++];
+    debugText += " " + String(i);
 
-    ecmSettings.ptSet[0] = (uint8_t)buffer[7];
-    ecmSettings.ptSet[1] = (uint8_t)buffer[8];
+    ecmSettings.ptSet[0] = (uint8_t)buffer[i++];
+    debugText += " " + String(i);
+    ecmSettings.ptSet[1] = (uint8_t)buffer[i++];
+    debugText += " " + String(i);
 
-    ecmSettings.sendInterval = (uint8_t)buffer[9];
+    ecmSettings.sendInterval = (uint8_t)buffer[i++];
+    debugText += " " + String(i);
+    i++;
 
-    ecmSettings.firmwareVersion = static_cast<double>((buffer[11] << 8) | buffer[12]) / 1000;
+    ecmSettings.firmwareVersion = static_cast<double>((buffer[i] << 8) | buffer[i + 1]) / 1000;
+    debugText += " " + String(i);
 
-    ecmSettings.serialNumber = String((uint16_t)buffer[13]) + String(((buffer[15] << 8) | buffer[14]));
-    int i = 0;
-    for (i; i < 5; i++) {
-      ecmSettings.auxX2[i] = (buffer[17] & (1 << i)) != 0;
+    i = i + 2;
+
+    ecmSettings.serialNumber = String((uint16_t)buffer[i]) + String(((buffer[i + 2] << 8) | buffer[i + 1]));
+    debugText += " " + String(i);
+
+    i = i + 3;
+
+    debugText += " " + String(i);
+    int y = 0;
+    for (y; y < 5; y++) {
+      ecmSettings.auxX2[y] = (buffer[i] & (1 << y)) != 0;
     }
 
-    if ((buffer[17] & (1 << i)) != 0) {
+    if ((buffer[i] & (1 << y)) != 0) {
       ecmSettings.aux5Option = 1;
-    } else if ((buffer[17] & (1 << ++i)) != 0) {
+    } else if ((buffer[i] & (1 << ++y)) != 0) {
       ecmSettings.aux5Option = 3;
     } else {
       ecmSettings.aux5Option = 0;
@@ -1303,7 +1343,6 @@ void handleStationMode() {
   } else {
     ecmSettings.gotSettings = false;
     getDeviceSettings();
-
 
     int networksFound = WiFi.scanNetworks();
     String networks = "";
@@ -1343,18 +1382,22 @@ void handleStationMode() {
     html += networks;
     html += "</select>";
     html += "<label>or enter the SSID:</label><input id='custom_ssid' class='full' maxlength='20' type='text' name='custom_ssid' value='" + String(ssid) + "'>";
-    html += "<label>Password:</label><input class='full' maxlength='20' type='password' name='password' value=''>";
+    html += "<label>Password:</label><input class='full' maxlength='64' type='password' name='password' value=''>";
     html += "<button class='button'>Submit</button>";
     html += "</form></div>";
     html += "<div><form action='/ip-config'><h3>IP Address Settings</h3>";
     html += "<label>Type:</label>DHCP: <input name='type' type='radio' ";
+
     if (!storedIPConfig.isConfigured) {
       html += "checked='checked'";
     }
+
     html += " value='0'>  Static: <input name='type' type='radio' ";
+
     if (storedIPConfig.isConfigured) {
       html += "checked='checked'";
     }
+
     html += " value='1'>";
     html += "<label>IP address:</label><input class='full' type='text' name='ip' value='" + WiFi.localIP().toString() + "'>";
     html += "<label>Subnet:</label><input class='full' type='text' name='subnet' value='" + WiFi.subnetMask().toString() + "'>";
@@ -1393,7 +1436,7 @@ void handleStationMode() {
     html += "</form></div>";
 
     html += "<div id='server'><form action='/serial-to-tcp-server'><h3>TCP Server Connection</h3>";
-    html += "<label>Disconnect Time (no activity):</label>Time (in seconds): <input type='number' min='1' max='30' name='idle_time' value='" + String(idleTime) + "'>";
+    html += "<label>Disconnect Time (no activity):</label>Time (in seconds): <input type='number' min='1' max='6000' name='idle_time' value='" + String(idleTime) + "'>";
     html += "<label>Port:</label><input class='full' type='number' name='port' value='" + String(tcpServerPort) + "'>";
     html += "<button class='button'>Save</button>";
     html += "</form></div>";
@@ -1470,9 +1513,16 @@ void handleStationMode() {
     html += "<label>Password:</label><input maxlength='20' class='full' type='password' name='pass' value=''>";
     html += "<button class='button'>Save</button>";
     html += "</form></div>";
+    html += "<div id='login'>";
+    html += "<h3>GEM Packets</h3><form action='/start-real'><input type='hidden' name='send_type' value='1'><button class='button'>Start Packets</button></form>";
+    html += "<form action='/stop-real'><input type='hidden' name='send_type' value='1'><button class='button'>Stop Packets</button></form>";
+    html += "<h3>ECM-1240 Packets</h3><form action='/start-real'><input type='hidden' name='send_type' value='0'><button class='button'>Start Packets</button></form>";
+    html += "<form action='/stop-real'><input type='hidden' name='send_type' value='0'><button class='button'>Stop Packets</button></form>";
+    html += "</div>";
     html += "<div id='settings'><h3>Device Settings</h3>";
     if (deviceType == 1) {
       html += "<form action='/ecm-settings'><h3>ECM Settings</h3>Type is a fine-tune value that increases the sensed value with each tick (255 Max). Range halves the sensed value with each increase.";
+      //html += "<label>Debug</label>" + debugText;
       html += "<label>Settings Retrieved?</label>" + boolToText(ecmSettings.gotSettings, false);
       html += "<label>Serial Number:</label>" + ecmSettings.serialNumber;
       html += "<label>Firmware Version:</label>" + String(ecmSettings.firmwareVersion, 4);
@@ -1481,7 +1531,7 @@ void handleStationMode() {
       html += "<label>Channel 2 Config:</label>Type: <input name='ch2type' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ch2Set[0]) + "'> Range: <input class='small' name='ch2range' type='number' min='1' max='255' value='" + String(ecmSettings.ch2Set[1]) + "'>";
       html += "<label>PT (Voltage) Config:</label>Type: <input name='pttype' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ptSet[0]) + "'>  Range: <input name='ptrange' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ptSet[1]) + "'>";
       html += "<label>AUX Channel Double:</label>AUX1:  <input type='checkbox' name='aux1x2' " + boolToText(ecmSettings.auxX2[0], true) + "> AUX2: <input type='checkbox' name='aux2x2' " + boolToText(ecmSettings.auxX2[1], true) + "> AUX3: <input type='checkbox' name='aux3x2' " + boolToText(ecmSettings.auxX2[2], true) + "> AUX4:  <input type='checkbox' name='aux4x2' " + boolToText(ecmSettings.auxX2[3], true) + "> AUX5: <input type='checkbox' name='aux5x2' " + boolToText(ecmSettings.auxX2[4], true) + " ><br>";
-      html += "<label>Aux 5 Options:</label>Power: <input name='aux5option' " + aux5Opt(0) + " type='radio' value='0'>  Pulse: <input name='aux5option' " + aux5Opt(1) + " type='radio' value='1'> DC: <input name='aux5option' " + aux5Opt(3) + " type='radio' value='3'>";
+      html += "<label>Aux 5 Options:</label>Power: <input name='aux5option' " + aux5Opt(0) + " type='radio' value='0'><br>Pulse: <input name='aux5option' " + aux5Opt(1) + " type='radio' value='1'><br>DC: <input name='aux5option' " + aux5Opt(3) + " type='radio' value='3'>";
       html += "<button class='button'>Update Settings</button></form>";
     } else if (deviceType == 2) {
       html += "<b>GreenEye Monitor Detected:</b> " + String(gemSerial) + "<br><br><br>";
@@ -1738,6 +1788,48 @@ void handleData() {
 
 void handleSerialDebug() {
   server.send(200, "text/html", serialDebug());
+}
+
+void handleStartReal() {
+  uint8_t sendType = server.arg("send_type").toInt();
+
+  if (sendType == 0) {
+    byte data = 0xFC;  // binary 0xFC
+    Serial.write(data);
+    delay(50);
+    Serial.write("TOG");
+    delay(50);
+    Serial.write("XTD");
+    delay(50);
+  } else {
+    Serial.write("^^^SYS_ON\r\n");
+  }
+
+  server.on("/", HTTP_GET, []() {
+    server.sendHeader("Location", "/main", true);  // Redirect to /main
+    server.send(302, "text/plain", "Redirecting to /main");
+  });
+}
+
+void handleStopReal() {
+  uint8_t sendType = server.arg("send_type").toInt();
+
+  if (sendType == 0) {
+    byte data = 0xFC;  // binary 0xFC
+    Serial.write(data);
+    delay(50);
+    Serial.write("TOG");
+    delay(50);
+    Serial.write("OFF");
+    delay(50);
+  } else {
+    Serial.write("^^^SYSOFF\r\n");
+  }
+
+  server.on("/", HTTP_GET, []() {
+    server.sendHeader("Location", "/main", true);  // Redirect to /main
+    server.send(302, "text/plain", "Redirecting to /main");
+  });
 }
 
 void handleECMSettings() {
@@ -2006,12 +2098,12 @@ void handleSerialToTcp() {
 void handleSerialToTcpServer() {
   // Serial to TCP client connection
   int port = server.arg("port").toInt();
-  uint8_t iTime = server.arg("idle_time").toInt();
+  uint16_t iTime = server.arg("idle_time").toInt();
 
   String html = getHTMLHeader(2);
 
   // Error test the client connection
-  if ((port > 1024 && port < 65536 && iTime > 0 && iTime < 31) || port == 0) {
+  if ((port > 1024 && port < 65536 && iTime > 0 && iTime < 6001) || port == 0) {
 
     EEPROM.put(tcpServerPortAddress, port);
     EEPROM.commit();
