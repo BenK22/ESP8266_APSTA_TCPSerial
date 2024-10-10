@@ -163,7 +163,7 @@ uint8_t mac[6];
 bool resetFlag = false;
 uint16_t idleTime = 5;
 
-String debugText = "";
+//String debugText = "";
 
 char ntpServer[40] = "pool.ntp.org";
 WiFiUDP ntpUDP;
@@ -1195,11 +1195,11 @@ void getDeviceSettings() {
       dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
       if (dataLength > 32) {
-        debugText = "Success " + String(buffer) + " " + String(dataLength);
+        //debugText = "Success " + String(buffer) + " " + String(dataLength);
         deviceType = 1;
         processECMSettings();
       } else {
-        debugText = String(buffer) + " " + String(dataLength);
+        //debugText = String(buffer) + " " + String(dataLength);
         tryGEM = true;
       }
     } else {
@@ -1293,35 +1293,35 @@ void processECMSettings() {
     ecmSettings.gotSettings = true;
 
     ecmSettings.ch1Set[0] = (uint8_t)buffer[i++];
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
     ecmSettings.ch1Set[1] = (uint8_t)buffer[i++];
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
 
     ecmSettings.ch2Set[0] = (uint8_t)buffer[i++];
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
     ecmSettings.ch2Set[1] = (uint8_t)buffer[i++];
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
 
     ecmSettings.ptSet[0] = (uint8_t)buffer[i++];
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
     ecmSettings.ptSet[1] = (uint8_t)buffer[i++];
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
 
     ecmSettings.sendInterval = (uint8_t)buffer[i++];
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
     i++;
 
     ecmSettings.firmwareVersion = static_cast<double>((buffer[i] << 8) | buffer[i + 1]) / 1000;
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
 
     i = i + 2;
 
     ecmSettings.serialNumber = String((uint16_t)buffer[i]) + String(((buffer[i + 2] << 8) | buffer[i + 1]));
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
 
     i = i + 3;
 
-    debugText += " " + String(i);
+    //debugText += " " + String(i);
     int y = 0;
     for (y; y < 5; y++) {
       ecmSettings.auxX2[y] = (buffer[i] & (1 << y)) != 0;
