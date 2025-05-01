@@ -11,9 +11,9 @@
 
 #define LEAP_YEAR(Y) ((Y > 0) && !(Y % 4) && ((Y % 100) || !(Y % 400)))
 
-const String ver = "v1.99c";
+const String ver = "v2.00";
 
-// EEPROM memory locations
+// EEPROM memory lodations
 const int eepromSize = 4096;
 const int ssidAddress = 0;
 
@@ -38,8 +38,6 @@ const int ntpServerAddress = 982;
 const int isNewPasswordAddress = 1001;
 const int newPasswordAddress = 1002;
 const int idleTimeAddress = 1069;
-
-
 
 // MQTT config
 struct MqttData {
@@ -74,6 +72,8 @@ char password[65] = "";
 String apName = "Brultech-";
 char apPassword[9] = "brultech";
 bool inAP = false;
+
+WiFiClient ecmClient;  // Declare globally
 
 struct IPAddressConfig {
   bool isConfigured = false;  // Flag indicating if configuration is stored
@@ -129,9 +129,12 @@ EcmSettings ecmSettings;
 uint32_t baud = 115200;
 
 // Serial buffer
-const int MAX_DATA_LENGTH = 2048;  // Set the maximum length of the data
-char buffer[MAX_DATA_LENGTH];      // Declare the array to store the data
-int dataLength = 0;                // Declare a variable to keep track of the length of the data
+const int MAX_DATA_LENGTH = 2048;    // Set the maximum length of the data
+char buffer[MAX_DATA_LENGTH];        // Declare the array to store the data
+char sharedBuffer[MAX_DATA_LENGTH];  // Declare the array to store the data
+int dataLength = 0;                  // Declare a variable to keep track of the length of the data
+int sharedDataLength = 0;            // Declare a variable to keep track of the length of the data
+bool newData = false;
 
 // Web Server config
 #define HTTP_MAX_HEADER_SIZE 4096
@@ -147,7 +150,7 @@ char loginPass[20] = "";
 
 // TCP Client/Server
 WiFiClient tcpClient;
-IPAddress tcpIP = IPAddress(0, 0, 0, 0);
+IPAddress tcpIP = IPAddress(192, 168, 4, 1);
 uint16_t tcpPort = 0;
 
 uint16_t tcpServerPort = 8000;
@@ -261,7 +264,7 @@ void setup() {
   Serial.begin(baud);
   Serial.setRxBufferSize(1024);
   Serial.flush();
-  Serial.setTimeout(300);
+  Serial.setTimeout(100);
 
   tcpIP = getIP(tcpIPAddress);
   mqttServer = getIP(mqttServerAddress);
@@ -332,7 +335,11 @@ void setupWiFi() {
       tickerAP.detach();
       tickerSTA.attach(0.5, toggleLED);  // Start the thread
       WiFi.mode(WIFI_STA);
+      WiFi.setPhyMode(WIFI_PHY_MODE_11G);
       WiFi.begin(ssid, password);
+      WiFi.setAutoReconnect(true);
+      WiFi.persistent(true);
+
       inAP = false;
 
       int x = 0;
@@ -476,150 +483,160 @@ void resetMemory() {
   EEPROM.commit();
 }
 
-void loop() {
-  // Reset debounce
-  if (resetFlag) {
-    resetFlag = false;
-    delay(3000);
-    if (digitalRead(RESET_PIN) == LOW) {
-      digitalWrite(LED_PIN, LOW);  // Turn off the LED
-      delay(2000);
-      digitalWrite(LED_PIN, HIGH);  // Turn off the LED
-      delay(2000);
-      digitalWrite(LED_PIN, LOW);  // Turn off the LED
-      resetMemory();
-      digitalWrite(LED_PIN, HIGH);  // Turn off the LED
-      ESP.restart();
-    }
+void handleReset() {
+  resetFlag = false;
+  delay(3000);
+  if (digitalRead(RESET_PIN) == LOW) {
+    digitalWrite(LED_PIN, LOW);  // Turn off the LED
+    delay(2000);
+    digitalWrite(LED_PIN, HIGH);  // Turn off the LED
+    delay(2000);
+    digitalWrite(LED_PIN, LOW);  // Turn off the LED
+    resetMemory();
+    digitalWrite(LED_PIN, HIGH);  // Turn off the LED
+    ESP.restart();
   }
+}
+
+void handleTcpServer() {
 
   // TCP Server mode
-  WiFiClient ecmClient = ecmServer.available();
+  WiFiClient newClient = ecmServer.available();  // Check for a new client
+
+  if (newClient) {
+    if (ecmClient && ecmClient.connected()) {
+      newClient.stop();  // Reject the new connection
+    } else {
+      ecmClient = newClient;  // Accept new client
+    }
+  }
 
   unsigned long loopTime;
   unsigned long endTime;
   unsigned long elapsedTime;
   if (ecmClient && ecmClient.connected()) {
     ecmClient.setTimeout(5);
-    Serial.setTimeout(50);
 
     int startTime = millis();
     char temp;
     int x = 0;
 
-    while (ecmClient.connected()) {
-
-      if (millis() - startTime >= idleTime * 1000) {
-        break;
-      }
-
-      if (ecmClient.available()) {
-        dataLength = ecmClient.readBytes(buffer, sizeof(buffer));  // Read all available data from WiFi and store it in the buffer
-
-        Serial.write(buffer, dataLength);  // Send the entire buffer to the ECM-1240
-        dataLength = 0;
-        delay(10);
-      } else {
-        server.handleClient();
-      }
-
-      if (Serial.available()) {
-        while (Serial.available()) {
-
-          if (ecmClient.availableForWrite()) {
-            temp = Serial.read();
-            ecmClient.write(temp);
-
-            if (x < MAX_DATA_LENGTH) {
-              buffer[x] = temp;
-              x++;
-            }
-          } else {
-            delay(1);
-          }
-        }
-
-        startTime = millis();
-
-        if (sizeof(buffer) > 64) {
-          dataLength = x;
-          handlePacket();
-          x = 0;
-        }
-      }
-
-      delay(1);
-    }
-
-    ecmClient.stop();
-  } else {
-    // If not connected, start in Access Point mode
-    if (WiFi.status() != WL_CONNECTED) {
-      setupWiFi();
-    } else {
-      // UDP Detection, check for UDP json packet, respond if received, for GEM Network Utility
-      int packetSize = UDP.parsePacket();
-      if (packetSize) {
-        int len = UDP.read(udpPacket, 255);
-        if (len > 0) {
-          DeserializationError error = deserializeJson(doc, udpPacket);
-
-          if (!error) {
-            if (strcmp(doc["type"], "btech") == 0) {
-              if (strcmp(doc["cmd"], "req") == 0) {
-                // Send response packet
-                udpResponse = "{\"type\":\"" + deviceData.serialNumber + "-" + "esp8266-" + mqttClientID + "\", \"ip\":\"" + WiFi.localIP().toString() + "\"}";
-
-                char charArray[udpResponse.length() + 1];
-                udpResponse.toCharArray(charArray, udpResponse.length() + 1);
-
-                UDP.beginPacket(broadcastIP, UDP.remotePort());
-                UDP.write(charArray);
-                UDP.endPacket();
-              }
-            }
-          }
-        }
-      }
-    }
-
-
-    MDNS.update();
     server.handleClient();
 
-    // TCP Client mode
-    if (!tcpClient.connected() && tcpIP.isSet() && tcpPort > 1024 && tcpPort < 65536 && Serial.available()) {
-      tcpClient.connect(tcpIP, tcpPort);
-      tcpClient.setTimeout(100);
+    if (millis() - startTime >= idleTime * 1000) {
+      ecmClient.stop();
+      newClient.stop();
     }
 
-    if (tcpClient.connected()) {
-      // Handle the data passthru
+    while (ecmClient.available()) {
+      sharedDataLength = ecmClient.readBytes(sharedBuffer, sizeof(sharedBuffer));  // Read all available data from WiFi and store it in the buffer
+
+      Serial.write(sharedBuffer, sharedDataLength);  // Send the entire buffer to the ECM-1240
+      sharedDataLength = 0;
+      delay(100);
+
       if (Serial.available()) {
-        dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
-
-        tcpClient.write(buffer, dataLength);  // Send the entire buffer to the server
-
-        handlePacket();
-      }
-
-      if (tcpClient.available()) {
-        dataLength = tcpClient.readBytes(buffer, sizeof(buffer));  // Read all available data from WiFi and store it in the buffer
-
-        Serial.write(buffer, dataLength);  // Send the entire buffer to the ECM-1240
-      }
-
-      tcpClient.stop();
-    } else {
-      if (Serial.available()) {
-        dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
-
-        handlePacket();
+        sharedDataLength = Serial.readBytes(sharedBuffer, sizeof(sharedBuffer));  // Read all available data from serial and store it in the buffer
+        ecmClient.write(sharedBuffer, sharedDataLength);
+      } else {
+        ecmClient.write(Serial.available());
       }
     }
 
-    delay(10);
+    if (newData) {
+      ecmClient.write(buffer, dataLength);
+
+      startTime = millis();
+    }
+
+    delay(1);
   }
+}
+
+void handleUdpDetect() {
+  // UDP Detection, check for UDP json packet, respond if received, for GEM Network Utility
+  int packetSize = UDP.parsePacket();
+  if (packetSize) {
+    int len = UDP.read(udpPacket, 255);
+    if (len > 0) {
+      DeserializationError error = deserializeJson(doc, udpPacket);
+
+      if (!error) {
+        if (strcmp(doc["type"], "btech") == 0) {
+          if (strcmp(doc["cmd"], "req") == 0) {
+            // Send response packet
+            udpResponse = "{\"type\":\"SN: " + deviceData.serialNumber + " " + " esp8266-" + mqttClientID + "\", \"ip\":\"" + WiFi.localIP().toString() + "\"}";
+
+            char charArray[udpResponse.length() + 1];
+            udpResponse.toCharArray(charArray, udpResponse.length() + 1);
+
+            UDP.beginPacket(broadcastIP, UDP.remotePort());
+            UDP.write(charArray);
+            UDP.endPacket();
+          }
+        }
+      }
+    }
+  }
+}
+
+void handleTcpClient() {
+  // TCP Client mode
+  if (!tcpClient.connected() && tcpIP.isSet() && tcpPort > 1024 && tcpPort < 65536) {
+    tcpClient.connect(tcpIP, tcpPort);
+    tcpClient.setTimeout(100);
+  }
+
+  if (tcpClient.connected()) {
+    // Handle the data passthru
+    if (newData) {
+      tcpClient.write(buffer, dataLength);  // Send the entire buffer to the server
+    }
+
+    while (tcpClient.available()) {
+      sharedDataLength = tcpClient.readBytes(sharedBuffer, sizeof(sharedBuffer));  // Read all available data from WiFi and store it in the buffer
+
+      Serial.write(sharedBuffer, sharedDataLength);  // Send the entire buffer 
+
+      delay(100);
+
+      if (Serial.available()) {
+        sharedDataLength = Serial.readBytes(sharedBuffer, sizeof(sharedBuffer));  // Read all available data from serial and store it in the buffer
+        ecmClient.write(sharedBuffer, sharedDataLength);
+      }
+    }
+
+    tcpClient.stop();
+  }
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    setupWiFi();
+  }
+
+  // Reset debounce
+  if (resetFlag) {
+    handleReset();
+  }
+
+  if (Serial.available()) {
+    dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
+
+    newData = true;
+    handlePacket();
+  }
+
+  server.handleClient();
+  handleTcpClient();
+  handleTcpServer();
+  handleUdpDetect();
+  MDNS.update();
+
+
+  newData = false;
+
+  delay(10);
 }
 
 void handleECM() {
@@ -649,7 +666,14 @@ void handleECM() {
         deviceData.polWattSeconds[0] = ((uint64_t)buffer[y + 19] << 32) | ((uint64_t)buffer[y + 18] << 24) | ((uint64_t)buffer[y + 17] << 16) | ((uint64_t)buffer[y + 16] << 8) | (uint64_t)buffer[y + 15];
         deviceData.polWattSeconds[1] = ((uint64_t)buffer[y + 24] << 32) | ((uint64_t)buffer[y + 23] << 24) | ((uint64_t)buffer[y + 22] << 16) | ((uint64_t)buffer[y + 21] << 8) | (uint64_t)buffer[y + 20];
 
-        deviceData.serialNumber = String((uint16_t)buffer[y + 32]) + String(((buffer[y + 29] << 8) | buffer[y + 30]));
+        String serialEnd = String(((uint16_t)buffer[y + 30] << 8) | (uint16_t)buffer[y + 29]);
+
+        // Add leading zeros if necessary to make it 5 characters long
+        while (serialEnd.length() < 5) {
+          serialEnd = "0" + serialEnd;
+        }
+
+        deviceData.serialNumber = String((uint16_t)buffer[y + 32]) + serialEnd;
 
         if (deviceData.prevSeconds != 0) {
           processPacket();
@@ -685,7 +709,15 @@ void ecmPacket() {
   deviceData.polWattSeconds[0] = ((uint64_t)buffer[19] << 32) | ((uint64_t)buffer[18] << 24) | ((uint64_t)buffer[17] << 16) | ((uint64_t)buffer[16] << 8) | (uint64_t)buffer[15];
   deviceData.polWattSeconds[1] = ((uint64_t)buffer[24] << 32) | ((uint64_t)buffer[23] << 24) | ((uint64_t)buffer[22] << 16) | ((uint64_t)buffer[21] << 8) | (uint64_t)buffer[20];
 
-  deviceData.serialNumber = String((uint16_t)buffer[32]) + String(((buffer[29] << 8) | buffer[30]));
+  String serialEnd = String(((uint16_t)buffer[30] << 8) | (uint16_t)buffer[29]);
+
+  // Add leading zeros if necessary to make it 5 characters long
+  while (serialEnd.length() < 5) {
+    serialEnd = "0" + serialEnd;
+  }
+
+
+  deviceData.serialNumber = String((uint16_t)buffer[32]) + serialEnd;
 
   if (deviceData.prevSeconds != 0) {
     processPacket();
@@ -756,7 +788,7 @@ void gemPacketLarge() {
 
   // Extract the voltage value as an unsigned integer
   deviceData.voltage = static_cast<float>((buffer[3] << 8) | buffer[4]) / 10;
-  deviceData.seconds = ((uint16_t)buffer[395] << 16) | ((uint16_t)buffer[394] << 8) | (uint16_t)buffer[393];
+  deviceData.seconds = ((uint16_t)buffer[587] << 16) | ((uint16_t)buffer[586] << 8) | (uint16_t)buffer[585];
 
   int v = 0;
   for (int z = 0; z < 32; z++) {
@@ -765,7 +797,7 @@ void gemPacketLarge() {
     deviceData.amps[z] = static_cast<float>((uint16_t)buffer[(z * 2) + 489] << 8 | (uint16_t)buffer[(z * 2) + 490]) / 50;
 
     if (z < 8) {
-      deviceData.temp[z] = static_cast<float>((uint16_t)buffer[(z * 2) + 601] << 8 | (uint16_t)buffer[(z * 2) + 600]) / 2;
+      deviceData.temp[z] = tempConv((uint16_t)buffer[(z * 2) + 601], (uint16_t)buffer[(z * 2) + 600]) / 2;
       if (z < 4) {
         deviceData.pulse[z] = ((uint64_t)buffer[(z * 3) + 590] << 16) | ((uint64_t)buffer[(z * 3) + 589] << 8) | (uint64_t)buffer[(z * 3) + 588];
       }
@@ -820,11 +852,17 @@ void handlePacket() {
   }
 }
 
+uint32_t power256(uint8_t exp) {
+    uint32_t result = 1;
+    while (exp--) result *= 256;
+    return result;
+}
+
 void processPacket() {
   uint16_t secDiff = 0;
 
   if (deviceData.prevSeconds > deviceData.seconds) {
-    secDiff = deviceData.seconds + 256 ^ 3 - deviceData.prevSeconds;
+    secDiff = (deviceData.seconds + power256(3)) - deviceData.prevSeconds;
   } else {
     secDiff = deviceData.seconds - deviceData.prevSeconds;
   }
@@ -840,51 +878,57 @@ void processPacket() {
     numChan = 32;
   }
 
-  for (int x = 0; x < numChan; x++) {
+  if(secDiff != 0) {
+    for (int x = 0; x < numChan; x++) {
 
-    if (x == 2 && deviceType == 1) {
-      wsMulti = 4;
-    }
-
-    if (deviceData.prevWattSeconds[x] > deviceData.wattSeconds[x]) {
-      deviceData.deltaWattSeconds[x] = (deviceData.wattSeconds[x] + 256 ^ wsMulti - deviceData.prevWattSeconds[x]);
-    } else {
-      deviceData.deltaWattSeconds[x] = (deviceData.wattSeconds[x] - deviceData.prevWattSeconds[x]);
-    }
-
-    if (x < 2 || deviceType == 2) {
-      if (deviceData.prevPolWattSeconds[x] > deviceData.polWattSeconds[x]) {
-        polWattSecDiff = (deviceData.polWattSeconds[x] + 256 ^ wsMulti - deviceData.prevPolWattSeconds[x]);
-      } else {
-        polWattSecDiff = (deviceData.polWattSeconds[x] - deviceData.prevPolWattSeconds[x]);
+      if (x == 2 && deviceType == 1) {
+        wsMulti = 4;
       }
 
-      deltaPolWs = deviceData.deltaWattSeconds[x] - (2 * polWattSecDiff);
+      if (deviceData.prevWattSeconds[x] > deviceData.wattSeconds[x]) {
+        deviceData.deltaWattSeconds[x] = (deviceData.wattSeconds[x] + power256(wsMulti) - deviceData.prevWattSeconds[x]);
+      } else {
+        deviceData.deltaWattSeconds[x] = (deviceData.wattSeconds[x] - deviceData.prevWattSeconds[x]);
+      }
 
-      deviceData.netWatts[x] = static_cast<float>(deltaPolWs) / secDiff;
-      deviceData.netKwh[x] = static_cast<float>(deltaPolWs) / 3600000;
-      deviceData.totalNetKwh[x] += deviceData.netKwh[x];
+      if (x < 2 || deviceType == 2) {
+        if (deviceData.prevPolWattSeconds[x] > deviceData.polWattSeconds[x]) {
+          polWattSecDiff = (deviceData.polWattSeconds[x] + power256(wsMulti) - deviceData.prevPolWattSeconds[x]);
+        } else {
+          polWattSecDiff = (deviceData.polWattSeconds[x] - deviceData.prevPolWattSeconds[x]);
+        }
+
+        deltaPolWs = deviceData.deltaWattSeconds[x] - (2 * polWattSecDiff);
+
+        deviceData.netWatts[x] = static_cast<float>(deltaPolWs) / secDiff;
+        deviceData.netKwh[x] = static_cast<float>(deltaPolWs) / 3600000;
+        deviceData.totalNetKwh[x] += deviceData.netKwh[x];
+      }
+
+      deviceData.watts[x] = deviceData.deltaWattSeconds[x] / secDiff;
+      deviceData.kwh[x] = static_cast<float>(deviceData.deltaWattSeconds[x]) / 3600000;
+      deviceData.totalKwh[x] += deviceData.kwh[x];
     }
-
-    deviceData.watts[x] = deviceData.deltaWattSeconds[x] / secDiff;
-    deviceData.kwh[x] = static_cast<float>(deviceData.deltaWattSeconds[x]) / 3600000;
-    deviceData.totalKwh[x] += deviceData.kwh[x];
+    
+    if (mqttPort != 0) {
+      mqttPost();
+    }
   }
-
-  mqttPost();
 }
 
 
-String serialDebug() {
-  String html = "<h3>Serial Debug:</h3><br><b>Buffer Length:</b> " + String(dataLength) + "<br><br><b>Packet:</b><br><br>";
-  char temp[3];  // Buffer to hold the formatted byte
+void serialDebug() {
+  server.sendContent(F("<h3>Serial Debug:</h3><br><b>Buffer Length:</b> "));
+  server.sendContent(String(dataLength) + F("<br><br><b>Packet:</b><br><br>"));
 
+  char temp[3];  // Buffer to hold the formatted byte
   for (int i = 0; i < dataLength; i++) {
     sprintf(temp, "%02X", buffer[i]);
-    html += String(temp) + " ";
+    server.sendContent(String(temp) + " ");
   }
 
-  return html;
+  server.sendContent("");
+  server.client().stop();
 }
 
 void mqttPost() {
@@ -936,83 +980,12 @@ void mqttPost() {
 void handleHA() {
   String html = getHTMLHeader(2);
 
-  /* struct MqttData {
-      bool channelEnabled[40] = { true };
-      String pulseUnits[4];
-      String pulseTypes[4];
-      char tempUnits[8];
-      String labels[40];
-      bool isConfigured = false;
-    };
-
-
-  deviceName = "ECM1240";*/
   uint8_t numChan = 7;
 
   if (deviceType == 2) {
     deviceName = "GEM";
     numChan = 32;
   }
-  /* for (int x = 0; x < 8; x++) {
-      mqttData.tempUnits[x] = server.arg("t" + String(x + 1) + "unit").charAt(0);
-      strcpy(mqttData.labels[x + numChan], server.arg("ch" + String(x + numChan + 1) + "label").c_str());
-
-      if (server.arg("ch" + String(x + numChan + 1) + "enable") == "1") {
-        mqttData.channelEnabled[x + numChan] = true;
-      } else {
-        mqttData.channelEnabled[x + numChan] = false;
-      }
-    }
-
-    for (int x = 0; x < 4; x++) {
-      strcpy(mqttData.pulseTypes[x], server.arg("p" + String(x + 1) + "type").c_str());
-      strcpy(mqttData.pulseUnits[x], server.arg("p" + String(x + 1) + "unit").c_str());
-      strcpy(mqttData.labels[x + numChan + 8], server.arg("ch" + String(x + numChan + 9) + "label").c_str());
-
-      if (mqttData.pulseUnits[x] == "0") {
-        strcpy(mqttData.pulseUnits[x], "m³");
-      } else if (mqttData.pulseUnits[x] == "1") {
-        strcpy(mqttData.pulseUnits[x], "ft³");
-      }
-
-      if (server.arg("ch" + String(x + numChan + 9) + "enable") == "1") {
-        mqttData.channelEnabled[x + numChan + 8] = true;
-      } else {
-        mqttData.channelEnabled[x + numChan + 8] = false;
-      }
-    }
-  } else {
-    strcpy(mqttData.pulseTypes[0], server.arg("p1type").c_str());
-    strcpy(mqttData.pulseUnits[0], server.arg("p1unit").c_str());
-
-    if (mqttData.pulseUnits[0] == "0") {
-      strcpy(mqttData.pulseUnits[0], "m³");
-    } else if (mqttData.pulseUnits[0] == "1") {
-      strcpy(mqttData.pulseUnits[0], "ft³");
-    }
-  }
-
-  for (int x = 0; x < numChan; x++) {
-    strcpy(mqttData.labels[x], server.arg("ch" + String(x + 1) + "label").c_str());
-
-    if (server.arg("ch" + String(x + 1) + "enable") == "1") {
-      mqttData.channelEnabled[x] = true;
-    } else {
-      mqttData.channelEnabled[x] = false;
-    }
-  }
-
-  mqttData.isConfigured = true;
-
-  // Write the IP settings structure to EEPROM
-  EEPROM.put(mqttDataAddress, mqttData);
-
-  EEPROM.commit();
-
-  html += "<div><h3>MQTT saved.</h3></div></html></body>";
-
-  server.send(200, "text/html", html);
-  return; */
 
   if (WiFi.status() == WL_CONNECTED && mqttServer.isSet()) {
 
@@ -1195,11 +1168,9 @@ void getDeviceSettings() {
       dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
       if (dataLength > 32) {
-        //debugText = "Success " + String(buffer) + " " + String(dataLength);
         deviceType = 1;
         processECMSettings();
       } else {
-        //debugText = String(buffer) + " " + String(dataLength);
         tryGEM = true;
       }
     } else {
@@ -1222,9 +1193,7 @@ void getDeviceSettings() {
       }
 
       deviceType = 2;
-    } else {
-      //getDeviceSettingsChangeBaud();
-    }
+    } 
   }
 }
 
@@ -1316,7 +1285,14 @@ void processECMSettings() {
 
     i = i + 2;
 
-    ecmSettings.serialNumber = String((uint16_t)buffer[i]) + String(((buffer[i + 2] << 8) | buffer[i + 1]));
+    String serialEnd = String(((buffer[i + 1] << 8) | buffer[i + 2]));
+
+    while (serialEnd.length() < 5) {
+      serialEnd = "0" + serialEnd;
+    }
+
+
+    ecmSettings.serialNumber = String((uint16_t)buffer[i]) + serialEnd;
     //debugText += " " + String(i);
 
     i = i + 3;
@@ -1348,213 +1324,154 @@ void handleStationMode() {
     String networks = "";
     bool selected = false;
     for (int i = 0; i < networksFound; i++) {
-      networks += "<option value='" + String(WiFi.SSID(i)) + "'";
+      networks += F("<option value='") + WiFi.SSID(i) + "'";
       if (!selected) {
         if (String(ssid).equals(WiFi.SSID(i))) {
-          networks += " selected='selected'";
+          networks += F(" selected='selected'");
           selected = true;
         }
       }
-      networks += ">" + String(WiFi.SSID(i)) + " <b>RSSI:</b> " + String(WiFi.RSSI(i)) + "</option>";
+      networks += F("'>") + WiFi.SSID(i) + F(" <b>RSSI:</b> ") + WiFi.RSSI(i) + F("</option>");
     }
 
     ntpClient.update();
-    // here begin chunked transfer
-    String html = getHTMLHeader(1);
-    // Station mode webpage
 
-    html += "<div><h3>Brultech Config " + ver + "</h3><br><a href='http://" + localAddress + ".local/'>http://" + localAddress + ".local/</a></div>";
-    html += "<div id='network'><form action='/config'><h3>Menu</h3>";
-    html += "<a href='#network' class='button'>Network</a>";
-    html += "<a href='#baud' class='button'>Baud</a>";
-    html += "<a href='#client' class='button'>TCP Client</a>";
-    html += "<a href='#server' class='button'>TCP Server</a>";
-    html += "<a href='#mqtt' class='button'>MQTT</a>";
-    html += "<a href='#login' class='button'>Login</a>";
-    html += "<a href='#settings' class='button'>Device Settings</a>";
-    html += "<a href='#data' class='button'>Data</a>";
-    html += "<a href='#fw' class='button'>ESP Firmware</a>";
-    html += "<a href='#serialDebug' class='button'>Debug</a>";
-    html += "</div>";
-    html += "<div id='network'><form action='/config'><h3>Network Settings</h3>";
-    html += "<h4 style='color:#4CAF50;'>Connected to: " + String(WiFi.SSID()) + " <br><br>RSSI: " + String(WiFi.RSSI()) + "</h4>";
-    html += "<label>Select a new network:</label> <select id='ssid' name='ssid'>";
-    html += networks;
-    html += "</select>";
-    html += "<label>or enter the SSID:</label><input id='custom_ssid' class='full' maxlength='20' type='text' name='custom_ssid' value='" + String(ssid) + "'>";
-    html += "<label>Password:</label><input class='full' maxlength='64' type='password' name='password' value=''>";
-    html += "<button class='button'>Submit</button>";
-    html += "</form></div>";
-    html += "<div><form action='/ip-config'><h3>IP Address Settings</h3>";
-    html += "<label>Type:</label>DHCP: <input name='type' type='radio' ";
+    // Begin chunked transfer by sending initial part of the HTML
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", getHTMLHeader(1));
 
-    if (!storedIPConfig.isConfigured) {
-      html += "checked='checked'";
+    server.sendContent(F("<html><head><title>Brultech Config</title></head><body>"));
+    server.sendContent(F("<div><h3>Brultech Config ") + ver + F("</h3><br><a href='http://") + localAddress + F(".local/'>http://") + localAddress + F(".local/</a></div>"));
+    server.sendContent(F("<div id='network'><form action='/config'><h3>Menu</h3>"));
+    server.sendContent(F("<a href='#network' class='button'>Network</a>"));
+    server.sendContent(F("<a href='#baud' class='button'>Baud</a>"));
+    server.sendContent(F("<a href='#client' class='button'>TCP Client</a>"));
+    server.sendContent(F("<a href='#server' class='button'>TCP Server</a>"));
+    server.sendContent(F("<a href='#mqtt' class='button'>MQTT</a>"));
+    server.sendContent(F("<a href='#login' class='button'>Login</a>"));
+    server.sendContent(F("<a href='#settings' class='button'>Device Settings</a>"));
+    server.sendContent(F("<a href='#data' class='button'>Data</a>"));
+    server.sendContent(F("<a href='#fw' class='button'>ESP Firmware</a>"));
+    server.sendContent(F("<a href='#serialDebug' class='button'>Debug</a></div>"));
+
+    // Network settings
+    server.sendContent(F("<div id='network'><form action='/config'><h3>Network Settings</h3>"));
+    server.sendContent(F("<h4 style='color:#4CAF50;'>Connected to: ") + WiFi.SSID() + F(" <br><br>RSSI: ") + WiFi.RSSI() + F("</h4>"));
+    server.sendContent(F("<label>Select a new network:</label> <select id='ssid' name='ssid'>") + networks + F("</select>"));
+    server.sendContent(F("<label>or enter the SSID:</label><input id='custom_ssid' class='full' maxlength='20' type='text' name='custom_ssid' value='") + String(ssid) + F("'>"));
+    server.sendContent(F("<label>Password:</label><input class='full' maxlength='64' type='password' name='password' value=''>"));
+    server.sendContent(F("<button class='button'>Submit</button></form></div>"));
+
+    // IP Address Settings
+    server.sendContent(F("<div><form action='/ip-config'><h3>IP Address Settings</h3>"));
+    server.sendContent(F("<label>Type:</label>DHCP: <input name='type' type='radio' ") + (storedIPConfig.isConfigured ? "" : String("checked='checked'")) + String(" value='0'>"));
+    server.sendContent(F("  Static: <input name='type' type='radio' ") + (storedIPConfig.isConfigured ? String("checked='checked'") : "") + String(" value='1'>"));
+    server.sendContent(F("<label>IP address:</label><input class='full' type='text' name='ip' value='") + WiFi.localIP().toString() + F("'>"));
+    server.sendContent(F("<label>Subnet:</label><input class='full' type='text' name='subnet' value='") + WiFi.subnetMask().toString() + F("'>"));
+    server.sendContent(F("<label>Gateway:</label><input class='full' type='text' name='gateway' value='") + WiFi.gatewayIP().toString() + F("'>"));
+    server.sendContent(F("<label>DNS</label><input class='full' type='text' name='dns' value='") + WiFi.dnsIP(0).toString() + F("'>"));
+    server.sendContent(F("<button class='button'>Save Settings</button></form></div>"));
+
+    // Baud Rate Settings
+    server.sendContent(F("<div id='baud'><form action='/baud'><h3>Change Baud Rate</h3>"));
+    server.sendContent(F("19200: <input type='radio' name='baud' value='19200'") + (baud == 19200 ? String(" checked='checked'") : "") + F(">"));
+    server.sendContent(F(" 115200: <input type='radio' name='baud' value='115200'") + (baud == 115200 ? String(" checked='checked'") : "") + F(">"));
+    server.sendContent(F("<br><button class='button'>Save Baudrate</button></form></div>"));
+
+    server.sendContent(F("</form></div>"));
+
+
+
+    server.sendContent(F("<div id='client'><form action='/ntp-server'><h3>Time Server</h3>"));
+    server.sendContent(F("<label>UTC Time:</label>") + String(getFormattedDate()) + F("<br>"));
+    server.sendContent(F("<label>NTP Server:</label><input class='full' type='text' name='ntp_server' value='") + String(ntpServer) + F("'>"));
+    server.sendContent(F("<button class='button'>Change Server</button>"));
+    server.sendContent(F("</form></div>"));
+
+    server.sendContent(F("<div id='client'><form action='/serial-to-tcp'><h3>Serial to TCP Client</h3>"));
+    server.sendContent(F("<label>IP address:</label><input class='full' type='text' name='ip' value='") + tcpIP.toString() + F("'>"));
+    server.sendContent(F("<label>Port:</label><input class='full' type='number' name='port' value='") + String(tcpPort) + F("'>"));
+    server.sendContent(F("<button class='button'>Connect</button>"));
+    server.sendContent(F("</form></div>"));
+
+    server.sendContent(F("<div id='server'><form action='/serial-to-tcp-server'><h3>TCP Server Connection</h3>"));
+    if (ecmClient.connected()) {
+      server.sendContent(F("<label>Connected:</label> Connected "));
+    } else {
+      server.sendContent(F("<label>Connected:</label> Not Connected"));
     }
+    server.sendContent(F("<label>Disconnect Time (no activity):</label>Time (in seconds): <input type='number' min='1' max='6000' name='idle_time' value='") + String(idleTime) + F("'>"));
+    server.sendContent(F("<label>Port:</label><input class='full' type='number' name='port' value='") + String(tcpServerPort) + F("'>"));
+    server.sendContent(F("<button class='button'>Save</button>"));
+    server.sendContent(F("</form></div>"));
 
-    html += " value='0'>  Static: <input name='type' type='radio' ";
-
-    if (storedIPConfig.isConfigured) {
-      html += "checked='checked'";
-    }
-
-    html += " value='1'>";
-    html += "<label>IP address:</label><input class='full' type='text' name='ip' value='" + WiFi.localIP().toString() + "'>";
-    html += "<label>Subnet:</label><input class='full' type='text' name='subnet' value='" + WiFi.subnetMask().toString() + "'>";
-    html += "<label>Gateway:</label><input class='full' type='text' name='gateway' value='" + WiFi.gatewayIP().toString() + "'>";
-    html += "<label>DNS</label><input class='full' type='text' name='dns' value='" + WiFi.dnsIP(0).toString() + "'>";
-    html += "<button class='button'>Save Settings</button>";
-    html += "</form></div>";
-    html += "<div id='baud'><form action='/baud'><h3>Change Baud Rate</h3>";
-    html += "19200: <input type='radio' name='baud' value='19200'";
-
-    if (baud == 19200) {
-      html += " checked='checked'";
-    }
-
-    html += "> 115200: <input type='radio' name='baud' value='115200'";
-
-    if (baud == 115200) {
-      html += " checked='checked'";
-    }
-
-    html += "><br><button class='button'>Save Baudrate</button>";
-    html += "</form></div>";
-
-
-
-    html += "<div id='client'><form action='/ntp-server'><h3>Time Server</h3>";
-    html += "<label>UTC Time:</label>" + getFormattedDate() + "<br>";
-    html += "<label>NTP Server:</label><input class='full' type='text' name='ntp_server' value='" + String(ntpServer) + "'>";
-    html += "<button class='button'>Change Server</button>";
-    html += "</form></div>";
-
-    html += "<div id='client'><form action='/serial-to-tcp'><h3>Serial to TCP Client</h3>";
-    html += "<label>IP address:</label><input class='full' type='text' name='ip' value='" + tcpIP.toString() + "'>";
-    html += "<label>Port:</label><input class='full' type='number' name='port' value='" + String(tcpPort) + "'>";
-    html += "<button class='button'>Connect</button>";
-    html += "</form></div>";
-
-    html += "<div id='server'><form action='/serial-to-tcp-server'><h3>TCP Server Connection</h3>";
-    html += "<label>Disconnect Time (no activity):</label>Time (in seconds): <input type='number' min='1' max='6000' name='idle_time' value='" + String(idleTime) + "'>";
-    html += "<label>Port:</label><input class='full' type='number' name='port' value='" + String(tcpServerPort) + "'>";
-    html += "<button class='button'>Save</button>";
-    html += "</form></div>";
-
-    html += "<div id='mqtt'><form action='/mqtt'><h3>MQTT Server Connection</h3>";
-    html += "<label>IP address/Domain:</label><input class='full' type='text' name='ip' value='" + mqttServer.toString() + "'>";
-    html += "<label>Port:</label><input class='full' type='number' name='port' value='" + String(mqttPort) + "'>";
-    html += "<label>User:</label><input class='full' maxlength='20'  type='text' name='user' value='" + String(mqttUser) + "'>";
-    html += "<label>Password:</label><input  maxlength='20' class='full' type='password' name='pass' value=''>";
-    html += "<button class='button'>Save</button>";
-    html += "</form><form action='/send-ha'><h3>Home-Assistant Config</h3>";
-
-    /*<a class='button' href='#' id='toggleMqtt'>Open Advanced Config</a><div id='advancedMqtt' style='display:none;'>";
-
+    server.sendContent(F("<div id='mqtt'><form action='/mqtt'><h3>MQTT Server Connection</h3>"));
+    server.sendContent(F("<label>IP address/Domain:</label><input class='full' type='text' name='ip' value='") + mqttServer.toString() + F("'>"));
+    server.sendContent(F("<label>Port:</label><input class='full' type='number' name='port' value='") + String(mqttPort) + F("'>"));
+    server.sendContent(F("<label>User:</label><input class='full' maxlength='20'  type='text' name='user' value='") + String(mqttUser) + F("'>"));
+    server.sendContent(F("<label>Password:</label><input  maxlength='20' class='full' type='password' name='pass' value=''>"));
+    server.sendContent(F("<button class='button'>Save</button>"));
+    server.sendContent(F("</form><form action='/send-ha'><h3>Home-Assistant Config</h3>"));
+    server.sendContent(F("<br><button class='button'>Send Config</button>"));
+    server.sendContent(F("</form></div>"));
+    server.sendContent(F("<div id='login'><form action='/login-settings'><h3>Login Information</h3>"));
+    server.sendContent(F("<label>User:</label><input maxlength='20' class='full' type='text' name='user' value='") + String(loginUser) + F("'>"));
+    server.sendContent(F("<label>Password:</label><input maxlength='20' class='full' type='password' name='pass' value=''>"));
+    server.sendContent(F("<button class='button'>Save</button>"));
+    server.sendContent(F("</form></div>"));
+    server.sendContent(F("<div id='login'>"));
+    server.sendContent(F("<h3>GEM Packets</h3><form action='/start-real'><input type='hidden' name='send_type' value='1'><button class='button'>Start Packets</button></form>"));
+    server.sendContent(F("<form action='/stop-real'><input type='hidden' name='send_type' value='1'><button class='button'>Stop Packets</button></form>"));
+    server.sendContent(F("<h3>ECM-1240 Packets</h3><form action='/start-real'><input type='hidden' name='send_type' value='0'><button class='button'>Start Packets</button></form>"));
+    server.sendContent(F("<form action='/stop-real'><input type='hidden' name='send_type' value='0'><button class='button'>Stop Packets</button></form>"));
+    server.sendContent(F("</div>"));
+    server.sendContent(F("<div id='settings'><h3>Device Settings</h3>"));
     if (deviceType == 1) {
-      html += "<label>AUX #5:</label><select name='p1type'><option value='energy'>Energy</option><option value='gas'>Gas</option><option value='water'>Water</option></select>Unit: <select name='p1unit'><option value='L'>L</option><option value='gal'>gal</option><option value='m³'>m³</option><option value='ft³'>ft³</option><option value='CCF'>CCF</option></select>";
+      /*server.sendContent(F("<form action='/ecm-settings'><h3>ECM Settings</h3>Type is a fine-tune value that increases the sensed value with each tick (255 Max). Range halves the sensed value with each increase."));
+      server.sendContent(F("<label>Debug</label>" + debugText;
+      server.sendContent(F("<label>Settings Retrieved?</label>") + boolToText(ecmSettings.gotSettings, false));
+      server.sendContent(F("<label>Serial Number:</label>") + ecmSettings.serialNumber);
+      server.sendContent(F("<label>Firmware Version:</label>") + String(ecmSettings.firmwareVersion, 4));
+      server.sendContent(F("<label>Packet Send Interval:</label><input name='packet_send' class='small' type='number' min='1' max='255' value='") + String(ecmSettings.sendInterval) + F("'> (Max 255)"));
+      server.sendContent(F("<label>Channel 1 Config:</label>Type: <input name='ch1type' class='small' type='number' min='1' max='255' value='") + String(ecmSettings.ch1Set[0]) + "'> Range: <input class='small' name='ch1range' type='number' min='1' max='255' value='" + String(ecmSettings.ch1Set[1]) + F("'>"));
+      server.sendContent(F("<label>Channel 2 Config:</label>Type: <input name='ch2type' class='small' type='number' min='1' max='255' value='") + String(ecmSettings.ch2Set[0]) + "'> Range: <input class='small' name='ch2range' type='number' min='1' max='255' value='" + String(ecmSettings.ch2Set[1]) + F("'>"));
+      server.sendContent(F("<label>PT (Voltage) Config:</label>Type: <input name='pttype' class='small' type='number' min='1' max='255' value='") + String(ecmSettings.ptSet[0]) + "'>  Range: <input name='ptrange' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ptSet[1]) + F("'>"));
+      server.sendContent(F("<label>AUX Channel Double:</label>AUX1:  <input type='checkbox' name='aux1x2' ") + boolToText(ecmSettings.auxX2[0], true) + F("> AUX2: <input type='checkbox' name='aux2x2' ") + boolToText(ecmSettings.auxX2[1], true) + F("> AUX3: <input type='checkbox' name='aux3x2' ") + boolToText(ecmSettings.auxX2[2], true) + F("> AUX4:  <input type='checkbox' name='aux4x2' ") + boolToText(ecmSettings.auxX2[3], true) + F("> AUX5: <input type='checkbox' name='aux5x2' ") + boolToText(ecmSettings.auxX2[4], true) + F(" ><br>"));
+      server.sendContent(F("<label>Aux 5 Options:</label>Power: <input name='aux5option' ") + aux5Opt(0) + F(" type='radio' value='0'><br>Pulse: <input name='aux5option' ") + aux5Opt(1) + F(" type='radio' value='1'><br>DC: <input name='aux5option' ") + aux5Opt(3) + F(" type='radio' value='3'>"));
+      server.sendContent(F("<button class='button'>Update Settings</button></form>"));*/
+      server.sendContent(F("Please download our Interface Application program from <a href='https://www.brultech.com/software'>https://www.brultech.com/software</a> under the ECM-1240 section.<br><br>Web configuration will be included in a future firmware upgrade."));
+
     } else if (deviceType == 2) {
-
-      server.sendContent(html);
-      html = "";
-      for (int x = 1; x < 33; x++) {
-        html += "<label><input type='checkbox' name='ch" + String(x) + "enable' value='1' " + boolToText(mqttData.channelEnabled[x - 1], true) + ">CH" + String(x) + ": Label: <input maxlength='50' class='mid' type='text' name='ch" + String(x) + "label' value='" + mqttData.labels[x - 1] + "'></label>";
-      }
-      server.sendContent(html);
-
-      html = "";
-
-
-      for (int x = 1; x < 9; x++) {
-        html += "<label><input type='checkbox' name='ch" + String(x + 32) + "enable' value='1' " + boolToText(mqttData.channelEnabled[x + 31], true) + ">Temp " + String(x) + ":  Label: <input maxlength='50' class='mid' type='text' name='ch" + String(x + 32) + "label' value='" + mqttData.labels[x + 31] + "'> <select name='t" + String(x) + "type'><option value='C'>C</option><option value='F'>F</option></select></label>";
-      }
-      server.sendContent(html);
-
-      html = "";
-
-      for (int z = 1; z < 5; z++) {
-        html += "<label><input type='checkbox'  name='ch" + String(z + 40) + "enable' value='1' " + boolToText(mqttData.channelEnabled[z + 39], true) + ">Pulse " + z + ":  Label: <input maxlength='50' class='mid' type='text' name='ch" + String(z + 40) + "label' value='" + mqttData.labels[z + 39] + "'></label>Type: <select name='p" + String(z) + "type'><option value='gas'";
-        html += ">Gas</option><option value='water'";
-        html += ">Water</option></select> Unit: <select name='p" + String(z) + "unit'><option value='L'";
-
-        if (mqttData.pulseUnits[z - 1][0] == 'L') {
-          html += " selected='selected'";
-        }
-        html += ">L</option><option value='gal'";
-
-        if (mqttData.pulseUnits[z - 1][0] == 'g') {
-          html += " selected='selected'";
-        }
-        html += ">gal</option><option value='0'";
-
-        if (mqttData.pulseUnits[z - 1][0] == 'm') {
-          html += " selected='selected'";
-        }
-        html += ">m<sup>3</sup></option><option value='1'";
-
-        if (mqttData.pulseUnits[z - 1][0] == 'f') {
-          html += " selected='selected'";
-        }
-        html += ">ft<sup>3</sup></option><option value='CCF'";
-
-        if (mqttData.pulseUnits[z - 1][0] == 'C') {
-          html += " selected='selected'";
-        }
-        html += ">CCF</option></select>";
-      }
-    }
-
-    html += "</div>"; */
-
-    html += "<br><button class='button'>Send Config</button>";
-    html += "</form></div>";
-    html += "<div id='login'><form action='/login-settings'><h3>Login Information</h3>";
-    html += "<label>User:</label><input maxlength='20' class='full' type='text' name='user' value='" + String(loginUser) + "'>";
-    html += "<label>Password:</label><input maxlength='20' class='full' type='password' name='pass' value=''>";
-    html += "<button class='button'>Save</button>";
-    html += "</form></div>";
-    html += "<div id='login'>";
-    html += "<h3>GEM Packets</h3><form action='/start-real'><input type='hidden' name='send_type' value='1'><button class='button'>Start Packets</button></form>";
-    html += "<form action='/stop-real'><input type='hidden' name='send_type' value='1'><button class='button'>Stop Packets</button></form>";
-    html += "<h3>ECM-1240 Packets</h3><form action='/start-real'><input type='hidden' name='send_type' value='0'><button class='button'>Start Packets</button></form>";
-    html += "<form action='/stop-real'><input type='hidden' name='send_type' value='0'><button class='button'>Stop Packets</button></form>";
-    html += "</div>";
-    html += "<div id='settings'><h3>Device Settings</h3>";
-    if (deviceType == 1) {
-      html += "<form action='/ecm-settings'><h3>ECM Settings</h3>Type is a fine-tune value that increases the sensed value with each tick (255 Max). Range halves the sensed value with each increase.";
-      //html += "<label>Debug</label>" + debugText;
-      html += "<label>Settings Retrieved?</label>" + boolToText(ecmSettings.gotSettings, false);
-      html += "<label>Serial Number:</label>" + ecmSettings.serialNumber;
-      html += "<label>Firmware Version:</label>" + String(ecmSettings.firmwareVersion, 4);
-      html += "<label>Packet Send Interval:</label><input name='packet_send' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.sendInterval) + "'> (Max 255)";
-      html += "<label>Channel 1 Config:</label>Type: <input name='ch1type' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ch1Set[0]) + "'> Range: <input class='small' name='ch1range' type='number' min='1' max='255' value='" + String(ecmSettings.ch1Set[1]) + "'>";
-      html += "<label>Channel 2 Config:</label>Type: <input name='ch2type' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ch2Set[0]) + "'> Range: <input class='small' name='ch2range' type='number' min='1' max='255' value='" + String(ecmSettings.ch2Set[1]) + "'>";
-      html += "<label>PT (Voltage) Config:</label>Type: <input name='pttype' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ptSet[0]) + "'>  Range: <input name='ptrange' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ptSet[1]) + "'>";
-      html += "<label>AUX Channel Double:</label>AUX1:  <input type='checkbox' name='aux1x2' " + boolToText(ecmSettings.auxX2[0], true) + "> AUX2: <input type='checkbox' name='aux2x2' " + boolToText(ecmSettings.auxX2[1], true) + "> AUX3: <input type='checkbox' name='aux3x2' " + boolToText(ecmSettings.auxX2[2], true) + "> AUX4:  <input type='checkbox' name='aux4x2' " + boolToText(ecmSettings.auxX2[3], true) + "> AUX5: <input type='checkbox' name='aux5x2' " + boolToText(ecmSettings.auxX2[4], true) + " ><br>";
-      html += "<label>Aux 5 Options:</label>Power: <input name='aux5option' " + aux5Opt(0) + " type='radio' value='0'><br>Pulse: <input name='aux5option' " + aux5Opt(1) + " type='radio' value='1'><br>DC: <input name='aux5option' " + aux5Opt(3) + " type='radio' value='3'>";
-      html += "<button class='button'>Update Settings</button></form>";
-    } else if (deviceType == 2) {
-      html += "<b>GreenEye Monitor Detected:</b> " + String(gemSerial) + "<br><br><br>";
+      server.sendContent(F("<b>GreenEye Monitor Detected:</b> ") + String(gemSerial) + F("<br><br><br>"));
 
       if (tcpServerPort > 0) {
-        html += "<a class='button' href='http://" + WiFi.localIP().toString() + ":" + tcpServerPort + "/'>Click Here for Setup</a>";
+        String tmp = "192.168.4.1";
+
+        if (WiFi.status() == WL_CONNECTED) {
+          tmp = WiFi.localIP().toString();
+        }
+
+        server.sendContent(F("<a class='button' href='http://") + tmp + F(":") + String(tcpServerPort) + F("/'>Click Here for Setup</a>"));
       } else {
-        html += "Setup TCP Server for setup.";
+        server.sendContent(F("Setup TCP Server for setup."));
       }
 
     } else {
-      html += "No monitor detected.<br>On occasion the device type poll can fail, please try refreshing the browser window.<br><br>If detection continues to fail, try changing baud rates.<br><br>The ECM-1240 runs at 19200.<br><br>The GreenEye Monitor COM2 setting is generally set to 115200 but it may be set to 19200 on older models.";
+      server.sendContent(F("No monitor detected.<br>On occasion the device type poll can fail, please try refreshing the browser window.<br><br>If detection continues to fail, try changing baud rates.<br><br>The ECM-1240 runs at 19200.<br><br>The GreenEye Monitor COM2 setting is generally set to 115200 but it may be set to 19200 on older models."));
     }
-    html += "</div>";
-    html += "<div id='data'>";
-    html += "</div>";
-    html += "<div id='fw'><a href='/updater' class='button'>Update ESP Firmware</a><br><a href='/reboot' class='button'>Reboot</a></div><div id='serialDebug'>";
-    html += serialDebug();
-    html += "</div></body></html>";
+    server.sendContent(F("</div>"));
+    server.sendContent(F("<div id='data'>"));
+    server.sendContent(F("</div>"));
+    server.sendContent(F("<div id='fw'><a href='/updater' class='button'>Update ESP Firmware</a><br><a href='/reboot' class='button'>Reboot</a></div><div id='serialDebug'>"));
+    serialDebug();
+    server.sendContent(F("</div></body></html>"));
 
-    server.sendContent(html);
+
+    server.sendContent("");
+    server.client().stop();
   }
 }
+
 
 String aux5Opt(uint8_t opt) {
   if (ecmSettings.aux5Option == opt) {
@@ -1572,66 +1489,85 @@ String getDigits(int number, int digits) {
   return result;
 }
 
-String getData() {
-  String html = "<h3>Data:</h3><br>";
-  int chNum = 32;
+void getData() {
+  int chNum = (deviceType == 1) ? 7 : 32;
 
-  if (deviceType == 1) {
-    chNum = 7;
-  }
+  server.sendContent(F("<h3>Data:</h3><br>"));
+  server.sendContent(F("<table id='infoTable'>"));
+  server.sendContent(F("<tr><td style='width:125px; padding-bottom:5px;'><b>Serial Number</b></td><td>"));
+  server.sendContent(deviceData.serialNumber);
+  server.sendContent(F("</td></tr><tr><td><b>Seconds</b></td><td>"));
+  server.sendContent(String(deviceData.seconds));
+  server.sendContent(F("<br>"));
+  server.sendContent(String(deviceData.prevSeconds));
+  server.sendContent(F("</td></tr><tr><td><b>Voltage</b></td><td>"));
+  server.sendContent(String(deviceData.voltage));
+  server.sendContent(F("</td></tr></table>"));
 
-  html += "<table id='infoTable'>";
-  html += "<tr><td style='width:125px; padding-bottom:5px;'><b>Serial Number</b></td><td>" + deviceData.serialNumber + "</td></tr>";
-  html += "<tr><td><b>Seconds</b></td><td>" + String(deviceData.seconds) + "<br>" + String(deviceData.prevSeconds) + "</td></tr>";
-  html += "<tr><td><b>Voltage</b></td><td>" + String(deviceData.voltage) + "</td></tr>";
-  html += "</table>";
-
-  html += "<table id='chanTable'>";
-  html += "<tr><th>CH</th><th>Wattseconds</th><th>Pol WS</th><th>Watts</th><th>Amps</th><th>kWh</th><th>Net kWh</th></tr>";
-
+  server.sendContent(F("<table id='chanTable'>"));
+  server.sendContent(F("<tr><th>CH</th><th>Wattseconds</th><th>Pol WS</th><th>Watts</th><th>Amps</th><th>kWh</th><th>Net kWh</th></tr>"));
 
   for (int i = 0; i < chNum; i++) {
     if (deviceType != 1 || i < 2) {
-      html += "<tr><td><b>C" + String(i + 1) + "</b></td>";
+      server.sendContent(F("<tr><td><b>CH"));
+      server.sendContent(String(i + 1));
+      server.sendContent(F("</b></td>"));
     } else {
-      html += "<tr><td><b>AUX" + String(i - 1) + "</b></td>";
+      server.sendContent(F("<tr><td><b>AUX"));
+      server.sendContent(String(i - 1));
+      server.sendContent(F("</b></td>"));
     }
 
-    html += "<td>" + String(deviceData.wattSeconds[i]) + "<br>";
-    html += String(deviceData.prevWattSeconds[i]) + "</td>";
-    html += "<td>" + String(deviceData.polWattSeconds[i]) + "<br>";
-    html += String(deviceData.prevPolWattSeconds[i]) + "</td>";
-    html += "<td>" + String(deviceData.watts[i]) + "<br>";
-
+    server.sendContent(F("<td>"));
+    server.sendContent(String(deviceData.wattSeconds[i]));
+    server.sendContent(F("<br>"));
+    server.sendContent(String(deviceData.prevWattSeconds[i]));
+    server.sendContent(F("</td><td>"));
+    server.sendContent(String(deviceData.polWattSeconds[i]));
+    server.sendContent(F("<br>"));
+    server.sendContent(String(deviceData.prevPolWattSeconds[i]));
+    server.sendContent(F("</td><td>"));
+    server.sendContent(String(deviceData.watts[i]));
     if (deviceData.watts[i] != deviceData.netWatts[i]) {
-      html += String(deviceData.netWatts[i]);
+      server.sendContent(F("<br>"));
+      server.sendContent(String(deviceData.netWatts[i]));
     }
-
-    html += "</td><td>" + String(deviceData.amps[i]) + "</td>";
-    html += "<td>" + String(deviceData.kwh[i], 4) + "<br>";
-    html += String(deviceData.totalKwh[i], 4) + "</td>";
-    html += "<td>" + String(deviceData.netKwh[i], 4) + "<br>";
-    html += String(deviceData.totalNetKwh[i], 4) + "</td>";
-    html += "</tr>";
+    server.sendContent(F("</td><td>"));
+    server.sendContent(String(deviceData.amps[i]));
+    server.sendContent(F("</td><td>"));
+    server.sendContent(String(deviceData.kwh[i], 4));
+    server.sendContent(F("<br>"));
+    server.sendContent(String(deviceData.totalKwh[i], 4));
+    server.sendContent(F("</td><td>"));
+    server.sendContent(String(deviceData.netKwh[i], 4));
+    server.sendContent(F("<br>"));
+    server.sendContent(String(deviceData.totalNetKwh[i], 4));
+    server.sendContent(F("</td></tr>"));
   }
 
   if (deviceType == 2) {
-    html += "<tr><td><b>T</b></td><td colspan='6'>";
+    server.sendContent(F("<tr><td><b>T</b></td><td colspan='6'>"));
     for (int i = 0; i < 8; i++) {
-      html += "C" + String(i + 1) + ": " + String(deviceData.temp[i], 2) + " ";
+      server.sendContent(F("CH"));
+      server.sendContent(String(i + 1));
+      server.sendContent(F(": "));
+      server.sendContent(String(deviceData.temp[i], 2));
+      server.sendContent(F(" "));
     }
-    html += "</td></tr>";
-
-    html += "<tr><td><b>P</b></td><td colspan='6'>";
+    server.sendContent(F("</td></tr><tr><td><b>P</b></td><td colspan='6'>"));
     for (int i = 0; i < 4; i++) {
-      html += "C" + String(i + 1) + ": " + String(deviceData.pulse[i]) + " ";
+      server.sendContent(F("CH"));
+      server.sendContent(String(i + 1));
+      server.sendContent(F(": "));
+      server.sendContent(String(deviceData.pulse[i]));
+      server.sendContent(F(" "));
     }
-    html += "</td></tr>";
+    server.sendContent(F("</td></tr>"));
   }
 
-  html += "</table>";
-
-  return html;
+  server.sendContent(F("</table>"));
+  server.sendContent("");
+  server.client().stop();
 }
 
 String getHTMLHeader(uint8_t pageNum) {
@@ -1783,11 +1719,11 @@ void handleMQTTDebug() {
 }
 
 void handleData() {
-  server.send(200, "text/html", getData());
+  getData();
 }
 
 void handleSerialDebug() {
-  server.send(200, "text/html", serialDebug());
+  serialDebug();
 }
 
 void handleStartReal() {
@@ -1806,8 +1742,14 @@ void handleStartReal() {
   }
 
   server.on("/", HTTP_GET, []() {
-    server.sendHeader("Location", "/main", true);  // Redirect to /main
-    server.send(302, "text/plain", "Redirecting to /main");
+    String html = "<html><body>";
+    html += "<p>Real Time Started, redirecting to main...</p>";
+    html += "<script>";
+    html += "setTimeout(function(){ window.location.href = '/main'; }, 2000);";  // Redirect after 2 seconds
+    html += "</script>";
+    html += "</body></html>";
+
+    server.send(200, "text/html", html);  // Send HTML with JavaScript for redirect
   });
 }
 
@@ -1827,8 +1769,14 @@ void handleStopReal() {
   }
 
   server.on("/", HTTP_GET, []() {
-    server.sendHeader("Location", "/main", true);  // Redirect to /main
-    server.send(302, "text/plain", "Redirecting to /main");
+    String html = "<html><body>";
+    html += "<p>Real Time Stopped, redirecting to main...</p>";
+    html += "<script>";
+    html += "setTimeout(function(){ window.location.href = '/main'; }, 2000);";  // Redirect after 2 seconds
+    html += "</script>";
+    html += "</body></html>";
+
+    server.send(200, "text/html", html);  // Send HTML with JavaScript for redirect
   });
 }
 
