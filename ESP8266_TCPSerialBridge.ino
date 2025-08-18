@@ -10,15 +10,116 @@
 #include <NTPClient.h>
 
 #define LEAP_YEAR(Y) ((Y > 0) && !(Y % 4) && ((Y % 100) || !(Y % 400)))
+#define HTTP_MAX_HEADER_SIZE 4096
 
-const String ver = "v2.00";
+// Static CSS (shared across all pages)
+const char HTML_CSS[] PROGMEM = R"(
+<style>
+body { background-color:#c3c3c3; font-family: Arial, sans-serif; }
+select { font-size: 16px; font-family: Arial, sans-serif; }
+div { background-color: #fff; border: 1px solid #ccc; box-shadow: 0 2px 2px rgba(0, 0, 0, 0.1); margin: 50px auto; width: 600px; padding: 20px; text-align: center; }
+h1 { margin: 0 0 20px 0; }
+label { padding-top:5px; display: block; font-size: 16px; font-weight: bold; margin-bottom: 5px; text-align: left; }
+.full { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding: 10px; width: 100% ; }
+.small { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding: 10px; width: 100px ; }
+.mid { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding-left: 10px; padding-right: 10px; width: 150px ; }
+.button { background-color: #4CAF50; border: none; color: #fff; cursor: pointer; font-size: 16px; margin-top: 20px; padding: 10px; display:inline-block; margin:5px; text-decoration: none; }
+.button:hover { background-color: #45a049; }
+p.error { color: #f00; font-size: 14px; margin: 10px 0; text-align: left; }
+#chanTable {width: 100%; border-collapse: collapse;}
+#chanTable th, td {border: 1px solid black; padding: 8px; text-align: center;}
+#chanTable th {background-color: #f2f2f2;}
+#infoTable { margin: 0 auto; border:none; }
+#infoTable td { border:none; }
+#pleaseWait { width:500px; }
+legend { font-weight: bold; }
+</style>
+)";
 
-// EEPROM memory lodations
+// JS for STA Page
+const char HTML_JS_PAGE1[] PROGMEM = R"(
+<script>
+var ip = location.host;
+
+document.addEventListener('DOMContentLoaded', function() {
+    var selectBox = document.getElementById('ssid');
+    var textbox = document.getElementById('custom_ssid');
+    
+    selectBox.addEventListener('change', function() {
+        textbox.value = selectBox.value;
+    });
+    
+    // Add scan button functionality
+    var scanButton = document.getElementById('scan');
+    if (scanButton) {
+        scanButton.addEventListener('click', function() {
+            event.preventDefault(); // <-- Prevent form submission
+            scanButton.style.display = 'none'; // Hide button
+            scanNetworks(scanButton);
+        });
+    }
+});
+
+function scanNetworks(buttonToShow) {
+    const xhr = new XMLHttpRequest();
+    xhr.onreadystatechange = function() {
+      if (this.readyState === 4) {
+        if (this.status === 200) {
+            document.getElementById('ssid').innerHTML = this.responseText;
+        } else {
+            alert('Failed to scan networks.');
+        }
+        if (buttonToShow) {
+            buttonToShow.style.display = 'inline-block';
+        }
+      }
+    };
+
+    xhr.open('GET', '/scan');
+    xhr.send();
+}
+
+function updateDiv() {
+    const xhr = new XMLHttpRequest();
+    xhr.onreadystatechange = function() {
+        if (this.readyState === 4 && this.status === 200) {
+            document.getElementById("data").innerHTML = this.responseText;
+        }
+    };
+    xhr.open("GET", "/data");
+    xhr.send();
+    
+    const xhrTwo = new XMLHttpRequest();
+    xhrTwo.onreadystatechange = function() {
+        if (this.readyState === 4 && this.status === 200) {
+            document.getElementById("serialDebug").innerHTML = this.responseText;
+        }
+    };
+    xhrTwo.open("GET", "/serial-debug");
+    xhrTwo.send();
+}
+
+setInterval(updateDiv, 5000);
+</script>
+)";
+
+// JS to auto-kick back on settings confirmation
+const char HTML_JS_PAGE2[] PROGMEM = R"(
+<script>
+function goBack() { 
+    history.back(); 
+}
+setInterval(goBack, 5000);
+</script>
+)";
+
+constexpr const char FW_VERSION[] = "v2.04";
+
+// EEPROM memory locations
 const int eepromSize = 4096;
 const int ssidAddress = 0;
 
-// old address
-const int passwordAddress = 32;
+// addresses
 const int isFirstRunAddress = 64;
 const int tcpPortAddress = 65;
 const int tcpIPAddress = 69;
@@ -34,6 +135,10 @@ const int ipConfigAddress = 216;
 const int mqttDataAddress = 233;
 const int ntpServerAddress = 982;
 
+
+// old address
+const int passwordAddress = 32;
+
 //  shifted password location for legacy units, older F/W did not support full passwords
 const int isNewPasswordAddress = 1001;
 const int newPasswordAddress = 1002;
@@ -48,6 +153,43 @@ struct MqttData {
   char labels[44][15];
   bool isConfigured = false;
 };
+
+namespace Packet {
+// Framing bytes
+constexpr uint8_t HEADER_0 = 0xFE;
+constexpr uint8_t HEADER_1 = 0xFF;
+constexpr uint8_t FOOTER_0 = 0xFF;
+constexpr uint8_t FOOTER_1 = 0xFE;
+
+// Packet format/type identifiers
+constexpr uint8_t TYPE_ECM = 0x03;
+constexpr uint8_t TYPE_GEM = 0x07;
+constexpr uint8_t TYPE_GEM_LARGE = 0x05;
+
+// Offsets
+constexpr size_t TYPE_OFFSET = 2;
+constexpr size_t ECM_SIZE = 64;
+constexpr size_t GEM_SIZE = 428;
+constexpr size_t GEM_LARGE_SIZE = 624;
+}
+
+enum class DeviceType : uint8_t {
+  Unknown = 0,
+  GEM = 1,
+  ECM = 2
+};
+
+
+// Different overflow counters for wattseconds/seconds counters
+constexpr uint64_t WS_OVERFLOW[] = {
+  0,           // index 0 (unused)
+  0,           // index 1 (unused)
+  0,           // index 2 (unused)
+  1ULL << 24,  // 256^3
+  1ULL << 32,  // 256^4
+  1ULL << 40   // 256^5
+};
+
 
 IPAddress mqttServer = IPAddress(0, 0, 0, 0);
 char mqttUser[20] = {};
@@ -72,6 +214,9 @@ char password[65] = "";
 String apName = "Brultech-";
 char apPassword[9] = "brultech";
 bool inAP = false;
+String networkOptions = "";
+String tcpClientConnect = "Not connected.";
+int connectTries = 0;
 
 WiFiClient ecmClient;  // Declare globally
 
@@ -85,6 +230,7 @@ struct IPAddressConfig {
 
 IPAddressConfig storedIPConfig;
 
+int startTime = millis();
 
 // Device config
 struct DeviceData {
@@ -121,7 +267,7 @@ struct EcmSettings {
 };
 
 String gemSerial = "";
-uint8_t deviceType = 0;
+DeviceType deviceType = DeviceType::Unknown;
 String deviceName = "";
 
 DeviceData deviceData;
@@ -137,12 +283,12 @@ int sharedDataLength = 0;            // Declare a variable to keep track of the 
 bool newData = false;
 
 // Web Server config
-#define HTTP_MAX_HEADER_SIZE 4096
 WiFiClient webServerClient;
 
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 PubSubClient mqttClient(webServerClient);
+String mqttStatus = "";
 
 char loginUser[20] = "";
 char loginPass[20] = "";
@@ -261,7 +407,7 @@ void setup() {
   }
 
   // Start serial port
-  Serial.begin(baud);
+  Serial.begin(baud, SERIAL_8N1);
   Serial.setRxBufferSize(1024);
   Serial.flush();
   Serial.setTimeout(100);
@@ -285,12 +431,14 @@ void setup() {
 
   //here the list of headers to be recorded
   setupWebServer();
+  scanNetworks();
   setupWiFi();
-  getDeviceSettings();
+  //getDeviceSettings();
 
   pinMode(RESET_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RESET_PIN), resetToAP, FALLING);
 }
+
 
 void loadMQTTSettings() {
   EEPROM.get(mqttUserAddress, mqttUser);
@@ -344,14 +492,11 @@ void setupWiFi() {
 
       int x = 0;
 
-      while (WiFi.status() != WL_CONNECTED) {
-        delay(1000);
-
-        if (x > 5) {
-          break;
-        }
-
-        x++;
+      const unsigned long timeout = 15000;
+      unsigned long start = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
+        yield();    // let background tasks run, feed watchdog
+        delay(10);  // small delay to avoid hammering CPU too hard
       }
 
       if (WiFi.status() == WL_CONNECTED) {
@@ -415,10 +560,12 @@ void setupWebServer() {
   server.on("/data", handleData);
   server.on("/serial-debug", handleSerialDebug);
   server.on("/mqtt-debug", handleMQTTDebug);
+  server.on("/mqtt-test", mqttPost);
   server.on("/ntp-server", handleNTPServer);
   server.on("/reboot", handleReboot);
   server.on("/updater", handleUpdate);
   server.on("/apmain", handleAP);
+  server.on("/scan", handleScan);
   server.collectHeaders(headerkeys, headerkeyssize);
   httpUpdater.setup(&server, loginUser, loginPass);
   server.begin();
@@ -508,6 +655,7 @@ void handleTcpServer() {
       newClient.stop();  // Reject the new connection
     } else {
       ecmClient = newClient;  // Accept new client
+      startTime = millis();
     }
   }
 
@@ -515,32 +663,27 @@ void handleTcpServer() {
   unsigned long endTime;
   unsigned long elapsedTime;
   if (ecmClient && ecmClient.connected()) {
-    ecmClient.setTimeout(5);
+    ecmClient.setTimeout(100);
 
-    int startTime = millis();
     char temp;
     int x = 0;
 
     server.handleClient();
-
-    if (millis() - startTime >= idleTime * 1000) {
-      ecmClient.stop();
-      newClient.stop();
-    }
 
     while (ecmClient.available()) {
       sharedDataLength = ecmClient.readBytes(sharedBuffer, sizeof(sharedBuffer));  // Read all available data from WiFi and store it in the buffer
 
       Serial.write(sharedBuffer, sharedDataLength);  // Send the entire buffer to the ECM-1240
       sharedDataLength = 0;
-      delay(100);
+      delay(50);
 
       if (Serial.available()) {
         sharedDataLength = Serial.readBytes(sharedBuffer, sizeof(sharedBuffer));  // Read all available data from serial and store it in the buffer
         ecmClient.write(sharedBuffer, sharedDataLength);
-      } else {
-        ecmClient.write(Serial.available());
       }
+
+      startTime = millis();
+      yield();
     }
 
     if (newData) {
@@ -549,7 +692,11 @@ void handleTcpServer() {
       startTime = millis();
     }
 
-    delay(1);
+    if (millis() - startTime >= idleTime * 1000) {
+      ecmClient.stop();
+      newClient.stop();
+    }
+    yield();
   }
 }
 
@@ -581,34 +728,66 @@ void handleUdpDetect() {
 }
 
 void handleTcpClient() {
-  // TCP Client mode
-  if (!tcpClient.connected() && tcpIP.isSet() && tcpPort > 1024 && tcpPort < 65536) {
+  if (!tcpClient.connected()) {
+    tcpClientConnect = "Not Connected";
+  }
+
+  // Step 1: Connect if needed
+  if (!tcpClient.connected() && tcpIP.isSet() && tcpPort > 1024 && tcpPort < 65536 && newData) {
+    //connectTries++;
     tcpClient.connect(tcpIP, tcpPort);
     tcpClient.setTimeout(100);
   }
 
   if (tcpClient.connected()) {
-    // Handle the data passthru
+    tcpClientConnect = "Connected";
+    // Step 2: Send new packet if flagged — don't wait here
     if (newData) {
-      tcpClient.write(buffer, dataLength);  // Send the entire buffer to the server
+      tcpClient.write(buffer, dataLength);  // Fire-and-forget
     }
 
-    while (tcpClient.available()) {
-      sharedDataLength = tcpClient.readBytes(sharedBuffer, sizeof(sharedBuffer));  // Read all available data from WiFi and store it in the buffer
+    // Step 4: If response available, send to Serial
+    if (tcpClient.available()) {
+      sharedDataLength = tcpClient.read(sharedBuffer, sizeof(sharedBuffer));
+      if (sharedDataLength > 0) {
+        Serial.write(sharedBuffer, sharedDataLength);
 
-      Serial.write(sharedBuffer, sharedDataLength);  // Send the entire buffer 
+        // Step 5: Wait briefly for Serial reply
+        unsigned long serialWait = millis();
+        while (!Serial.available() && millis() - serialWait < 50) {
+          yield();
+        }
 
-      delay(100);
-
-      if (Serial.available()) {
-        sharedDataLength = Serial.readBytes(sharedBuffer, sizeof(sharedBuffer));  // Read all available data from serial and store it in the buffer
-        ecmClient.write(sharedBuffer, sharedDataLength);
+        // Step 6: If Serial replied, send that back to TCP server
+        if (Serial.available()) {
+          sharedDataLength = Serial.readBytes(sharedBuffer, sizeof(sharedBuffer));
+          if (sharedDataLength > 0) {
+            tcpClient.write(sharedBuffer, sharedDataLength);
+          }
+        }
       }
     }
 
+    // Step 7: We're done — close the client
     tcpClient.stop();
   }
 }
+
+void readSerialData() {
+  if (Serial.available()) {
+    dataLength = Serial.readBytes(buffer, sizeof(buffer));
+    newData = true;
+  }
+
+  if (newData) {
+    handlePacket();
+  }
+}
+
+
+unsigned long previousMillis = 0;    // will store last time heap was printed
+const unsigned long interval = 500;  // interval at which to print (milliseconds)
+
 
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -620,71 +799,57 @@ void loop() {
     handleReset();
   }
 
-  if (Serial.available()) {
-    dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
+  mqttClient.loop();
 
-    newData = true;
-    handlePacket();
-  }
+  readSerialData();
 
   server.handleClient();
-  handleTcpClient();
   handleTcpServer();
-  handleUdpDetect();
-  MDNS.update();
 
+  if (newData) {
+    handleTcpClient();
+    newData = false;
+  }
 
-  newData = false;
+  unsigned long currentMillis = millis();
 
-  delay(10);
+  if (currentMillis - previousMillis >= interval) {
+    MDNS.update();
+    handleUdpDetect();
+    previousMillis = currentMillis;
+  }
+
+  yield();
 }
 
-void handleECM() {
-  // Loop thru bytes to check for ECM packet
-  for (int y = 0; y < dataLength; y++) {
-    if ((y + 63) < dataLength) {
-      if (buffer[y] == 0xFE && buffer[y + 1] == 0xFF && buffer[y + 2] == 0x03 && buffer[y + 62] == 0xFF && buffer[y + 63] == 0xFE) {
-        memcpy(deviceData.prevWattSeconds, deviceData.wattSeconds, sizeof(deviceData.prevWattSeconds));
-        memcpy(deviceData.prevPolWattSeconds, deviceData.polWattSeconds, sizeof(deviceData.prevPolWattSeconds));
+void handlePacket() {
+  if (dataLength < Packet::ECM_SIZE) return;
 
-        deviceData.prevSeconds = deviceData.seconds;
+  if (buffer[0] != Packet::HEADER_0 || buffer[1] != Packet::HEADER_1) return;
 
-        // Extract the voltage value as an unsigned integer
-        deviceData.voltage = static_cast<float>((buffer[y + 3] << 8) | buffer[y + 4]) / 10;
-        deviceData.seconds = ((uint16_t)buffer[y + 39] << 16) | ((uint16_t)buffer[y + 38] << 8) | (uint16_t)buffer[y + 37];
+  if (dataLength >= Packet::GEM_LARGE_SIZE && buffer[Packet::TYPE_OFFSET] == Packet::TYPE_GEM_LARGE && buffer[622] == Packet::FOOTER_0 && buffer[623] == Packet::FOOTER_1) {
 
-
-        // Extract the 5/4-byte value as an unsigned integer
-        deviceData.wattSeconds[0] = ((uint64_t)buffer[y + 9] << 32) | ((uint64_t)buffer[y + 8] << 24) | ((uint64_t)buffer[y + 7] << 16) | ((uint64_t)buffer[y + 6] << 8) | (uint64_t)buffer[y + 5];
-        deviceData.wattSeconds[1] = ((uint64_t)buffer[y + 14] << 32) | ((uint64_t)buffer[y + 13] << 24) | ((uint64_t)buffer[y + 12] << 16) | ((uint64_t)buffer[y + 11] << 8) | (uint64_t)buffer[y + 10];
-        deviceData.wattSeconds[2] = ((uint64_t)buffer[y + 43] << 24) | ((uint64_t)buffer[y + 42] << 16) | ((uint64_t)buffer[y + 41] << 8) | (uint64_t)buffer[y + 40];
-        deviceData.wattSeconds[3] = ((uint64_t)buffer[y + 47] << 24) | ((uint64_t)buffer[y + 46] << 16) | ((uint64_t)buffer[y + 45] << 8) | (uint64_t)buffer[y + 44];
-        deviceData.wattSeconds[4] = ((uint64_t)buffer[y + 51] << 24) | ((uint64_t)buffer[y + 50] << 16) | ((uint64_t)buffer[y + 49] << 8) | (uint64_t)buffer[y + 48];
-        deviceData.wattSeconds[5] = ((uint64_t)buffer[y + 55] << 24) | ((uint64_t)buffer[y + 54] << 16) | ((uint64_t)buffer[y + 53] << 8) | (uint64_t)buffer[y + 52];
-        deviceData.wattSeconds[6] = ((uint64_t)buffer[y + 59] << 24) | ((uint64_t)buffer[y + 58] << 16) | ((uint64_t)buffer[y + 57] << 8) | (uint64_t)buffer[y + 56];
-
-        deviceData.polWattSeconds[0] = ((uint64_t)buffer[y + 19] << 32) | ((uint64_t)buffer[y + 18] << 24) | ((uint64_t)buffer[y + 17] << 16) | ((uint64_t)buffer[y + 16] << 8) | (uint64_t)buffer[y + 15];
-        deviceData.polWattSeconds[1] = ((uint64_t)buffer[y + 24] << 32) | ((uint64_t)buffer[y + 23] << 24) | ((uint64_t)buffer[y + 22] << 16) | ((uint64_t)buffer[y + 21] << 8) | (uint64_t)buffer[y + 20];
-
-        String serialEnd = String(((uint16_t)buffer[y + 30] << 8) | (uint16_t)buffer[y + 29]);
-
-        // Add leading zeros if necessary to make it 5 characters long
-        while (serialEnd.length() < 5) {
-          serialEnd = "0" + serialEnd;
-        }
-
-        deviceData.serialNumber = String((uint16_t)buffer[y + 32]) + serialEnd;
-
-        if (deviceData.prevSeconds != 0) {
-          processPacket();
-        }
-
-        break;
-      }
+    if (deviceType == DeviceType::Unknown) {
+      deviceType = DeviceType::GEM;
     }
+
+    gemPacketLarge();
+  } else if (dataLength >= Packet::GEM_SIZE && buffer[Packet::TYPE_OFFSET] == Packet::TYPE_GEM && buffer[426] == Packet::FOOTER_0 && buffer[427] == Packet::FOOTER_1) {
+
+    if (deviceType == DeviceType::Unknown) {
+      deviceType = DeviceType::GEM;
+    }
+
+    gemPacket();
+  } else if (buffer[Packet::TYPE_OFFSET] == Packet::TYPE_ECM && buffer[62] == Packet::FOOTER_0 && buffer[63] == Packet::FOOTER_1) {
+
+    if (deviceType == DeviceType::Unknown) {
+      deviceType = DeviceType::ECM;
+    }
+
+    ecmPacket();
   }
 }
-
 
 void ecmPacket() {
   memcpy(deviceData.prevWattSeconds, deviceData.wattSeconds, sizeof(deviceData.prevWattSeconds));
@@ -724,16 +889,6 @@ void ecmPacket() {
   }
 }
 
-float tempConv(uint16_t hi, uint16_t lo) {
-  if (((hi & 0x02) >> 1) == 1) {
-    return 8192.0;
-  } else if ((hi >> 7) != 1) {
-    return float(((hi & 0x01) << 8) | (lo & 0xFF));
-  } else {
-    return float(-1 * (((hi & 0x01) << 8) | (lo & 0xFF)));
-  }
-}
-
 void gemPacket() {
   memcpy(deviceData.prevWattSeconds, deviceData.wattSeconds, sizeof(deviceData.prevWattSeconds));
   memcpy(deviceData.prevPolWattSeconds, deviceData.polWattSeconds, sizeof(deviceData.prevPolWattSeconds));
@@ -761,17 +916,14 @@ void gemPacket() {
   String serial = String(((buffer[325] << 8) | buffer[326]));
   String id = String((uint16_t)buffer[328]);
 
-  if (id.length() < 3) {
-    while (id.length() < 3) {
-      id = "0" + id;
-    }
+  while (id.length() < 3) {
+    id = "0" + id;
   }
 
-  if (serial.length() < 5) {
-    while (serial.length() < 5) {
-      serial = "0" + serial;
-    }
+  while (serial.length() < 5) {
+    serial = "0" + serial;
   }
+
 
   deviceData.serialNumber = id + serial;
 
@@ -807,17 +959,14 @@ void gemPacketLarge() {
   String serial = String(((buffer[485] << 8) | buffer[486]));
   String id = String((uint16_t)buffer[488]);
 
-  if (id.length() < 3) {
-    while (id.length() < 3) {
-      id = "0" + id;
-    }
+  while (id.length() < 3) {
+    id = "0" + id;
   }
 
-  if (serial.length() < 5) {
-    while (serial.length() < 5) {
-      serial = "0" + serial;
-    }
+  while (serial.length() < 5) {
+    serial = "0" + serial;
   }
+
 
   deviceData.serialNumber = id + serial;
 
@@ -826,43 +975,23 @@ void gemPacketLarge() {
   }
 }
 
-void handlePacket() {
-  bool found = false;
-
-  if (dataLength > 63) {
-    if (dataLength > 63) {
-      if (buffer[0] == 0xFE && buffer[1] == 0xFF && buffer[2] == 0x03 && buffer[62] == 0xFF && buffer[63] == 0xFE) {
-        ecmPacket();
-        found = true;
-      }
-    }
-
-    if (dataLength > 427 && !found) {
-      if (buffer[0] == 0xFE && buffer[1] == 0xFF && buffer[2] == 0x07 && buffer[426] == 0xFF && buffer[427] == 0xFE) {
-        gemPacket();
-        found = true;
-      }
-    }
-
-    if (dataLength > 623 && !found) {
-      if (buffer[0] == 0xFE && buffer[1] == 0xFF && buffer[2] == 0x05 && buffer[622] == 0xFF && buffer[623] == 0xFE) {
-        gemPacketLarge();
-      }
-    }
+float tempConv(uint16_t hi, uint16_t lo) {
+  const uint16_t specialBit = (hi & 0x02) >> 1;
+  if (specialBit == 1) {
+    return 8192.0f;
   }
-}
 
-uint32_t power256(uint8_t exp) {
-    uint32_t result = 1;
-    while (exp--) result *= 256;
-    return result;
+  const uint16_t value = ((hi & 0x01) << 8) | (lo & 0xFF);
+  const bool isNegative = (hi & 0x80) != 0;
+
+  return isNegative ? -static_cast<float>(value) : static_cast<float>(value);
 }
 
 void processPacket() {
   uint16_t secDiff = 0;
 
   if (deviceData.prevSeconds > deviceData.seconds) {
-    secDiff = (deviceData.seconds + power256(3)) - deviceData.prevSeconds;
+    secDiff = (deviceData.seconds + WS_OVERFLOW[3]) - deviceData.prevSeconds;
   } else {
     secDiff = deviceData.seconds - deviceData.prevSeconds;
   }
@@ -874,26 +1003,26 @@ void processPacket() {
   uint8_t numChan = 7;
   uint8_t wsMulti = 5;
 
-  if (deviceType == 2) {
+  if (deviceType == DeviceType::GEM) {
     numChan = 32;
   }
 
-  if(secDiff != 0) {
+  if (secDiff != 0) {
     for (int x = 0; x < numChan; x++) {
 
-      if (x == 2 && deviceType == 1) {
+      if (x == 2 && deviceType == DeviceType::ECM) {
         wsMulti = 4;
       }
 
       if (deviceData.prevWattSeconds[x] > deviceData.wattSeconds[x]) {
-        deviceData.deltaWattSeconds[x] = (deviceData.wattSeconds[x] + power256(wsMulti) - deviceData.prevWattSeconds[x]);
+        deviceData.deltaWattSeconds[x] = (deviceData.wattSeconds[x] + WS_OVERFLOW[wsMulti] - deviceData.prevWattSeconds[x]);
       } else {
         deviceData.deltaWattSeconds[x] = (deviceData.wattSeconds[x] - deviceData.prevWattSeconds[x]);
       }
 
-      if (x < 2 || deviceType == 2) {
+      if (x < 2 || deviceType == DeviceType::GEM) {
         if (deviceData.prevPolWattSeconds[x] > deviceData.polWattSeconds[x]) {
-          polWattSecDiff = (deviceData.polWattSeconds[x] + power256(wsMulti) - deviceData.prevPolWattSeconds[x]);
+          polWattSecDiff = (deviceData.polWattSeconds[x] + WS_OVERFLOW[wsMulti] - deviceData.prevPolWattSeconds[x]);
         } else {
           polWattSecDiff = (deviceData.polWattSeconds[x] - deviceData.prevPolWattSeconds[x]);
         }
@@ -909,7 +1038,7 @@ void processPacket() {
       deviceData.kwh[x] = static_cast<float>(deviceData.deltaWattSeconds[x]) / 3600000;
       deviceData.totalKwh[x] += deviceData.kwh[x];
     }
-    
+
     if (mqttPort != 0) {
       mqttPost();
     }
@@ -932,79 +1061,118 @@ void serialDebug() {
 }
 
 void mqttPost() {
-  if (WiFi.status() == WL_CONNECTED && mqttServer.isSet()) {
+  if (WiFi.status() != WL_CONNECTED || !mqttServer.isSet()) {
+    mqttStatus = "WiFi not connected or MQTT IP not set.";
+    return;
+  }
+
+  if (!mqttClient.connected()) {
+    mqttClient.setSocketTimeout(5);
     mqttClient.setServer(mqttServer, mqttPort);
 
-    deviceName = "ECM1240";
-    uint8_t numChan = 7;
-
-    if (deviceType == 2) {
-      deviceName = "GEM";
-      numChan = 32;
-    }
-
     if (!mqttClient.connect(mqttClientID, mqttUser, mqttPass)) {
-      Serial.println("Failed to connect to MQTT broker");
+      mqttStatus = "MQTT Connection failed.";
       return;
     }
+  }
 
-    // Publish topics
-    mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/v").c_str(), String(deviceData.voltage).c_str());
+  const char* deviceName = (deviceType == DeviceType::GEM) ? "GEM" : "ECM1240";
+  const uint8_t numChan = (deviceType == DeviceType::GEM) ? 32 : 7;
 
-    for (int i = 0; i < numChan; i++) {
-      mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/c" + String(i + 1) + "/watt").c_str(), String(deviceData.watts[i]).c_str());
-      mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/c" + String(i + 1) + "/kwh").c_str(), String(deviceData.kwh[i], 5).c_str());
-      mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/c" + String(i + 1) + "/total_kwh").c_str(), String(deviceData.totalKwh[i], 5).c_str());
-      mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/c" + String(i + 1) + "/ws").c_str(), String(deviceData.wattSeconds[i]).c_str());
-      mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/c" + String(i + 1) + "/pws").c_str(), String(deviceData.polWattSeconds[i]).c_str());
-      mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/c" + String(i + 1) + "/dws").c_str(), String(deviceData.deltaWattSeconds[i]).c_str());
+  char topic[64];
+  char payload[64];
 
-      if (deviceType == 2) {
-        mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/c" + String(i + 1) + "/amp").c_str(), String(deviceData.amps[i]).c_str());
 
-        if (i < 8 && deviceType == 2) {
-          mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/t" + String(i + 1) + "/value").c_str(), String(deviceData.temp[i]).c_str());
+  // Voltage
+  snprintf(topic, sizeof(topic), "%s-%s/v", deviceName, deviceData.serialNumber);
+  snprintf(payload, sizeof(payload), "%.2f", deviceData.voltage);
+  mqttClient.publish(topic, payload, false);
+  yield();
 
-          if (i < 4) {
-            mqttClient.publish((deviceName + "-" + String(deviceData.serialNumber) + "/p" + String(i + 1) + "/value").c_str(), String(deviceData.pulse[i]).c_str());
-          }
+  for (uint8_t i = 0; i < numChan; i++) {
+    snprintf(payload, sizeof(payload), "%u", deviceData.watts[i]);
+    snprintf(topic, sizeof(topic), "%s-%s/c%u/watt", deviceName, deviceData.serialNumber, i + 1);
+    mqttClient.publish(topic, payload, false);
+    yield();
+
+    dtostrf(deviceData.kwh[i], 1, 5, payload);
+    snprintf(topic, sizeof(topic), "%s-%s/c%u/kwh", deviceName, deviceData.serialNumber, i + 1);
+    mqttClient.publish(topic, payload, false);
+    yield();
+
+    dtostrf(deviceData.totalKwh[i], 1, 5, payload);
+    snprintf(topic, sizeof(topic), "%s-%s/c%u/total_kwh", deviceName, deviceData.serialNumber, i + 1);
+    mqttClient.publish(topic, payload, false);
+    yield();
+
+    snprintf(payload, sizeof(payload), "%lu", deviceData.wattSeconds[i]);
+    snprintf(topic, sizeof(topic), "%s-%s/c%u/ws", deviceName, deviceData.serialNumber, i + 1);
+    mqttClient.publish(topic, payload, false);
+    yield();
+
+    snprintf(payload, sizeof(payload), "%lu", deviceData.polWattSeconds[i]);
+    snprintf(topic, sizeof(topic), "%s-%s/c%u/pws", deviceName, deviceData.serialNumber, i + 1);
+    mqttClient.publish(topic, payload, false);
+    yield();
+
+    snprintf(payload, sizeof(payload), "%lu", deviceData.deltaWattSeconds[i]);
+    snprintf(topic, sizeof(topic), "%s-%s/c%u/dws", deviceName, deviceData.serialNumber, i + 1);
+    mqttClient.publish(topic, payload, false);
+    yield();
+
+    if (deviceType == DeviceType::GEM) {
+      snprintf(payload, sizeof(payload), "%.2f", deviceData.amps[i]);
+      snprintf(topic, sizeof(topic), "%s-%s/c%u/amp", deviceName, deviceData.serialNumber, i + 1);
+      mqttClient.publish(topic, payload, false);
+      yield();
+
+      if (i < 8) {
+        snprintf(payload, sizeof(payload), "%.2f", deviceData.temp[i]);
+        snprintf(topic, sizeof(topic), "%s-%s/t%u/value", deviceName, deviceData.serialNumber, i + 1);
+        mqttClient.publish(topic, payload, false);
+        yield();
+
+        if (i < 4) {
+          snprintf(payload, sizeof(payload), "%.2f", deviceData.pulse[i]);
+          snprintf(topic, sizeof(topic), "%s-%s/p%u/value", deviceName, deviceData.serialNumber, i + 1);
+          mqttClient.publish(topic, payload, false);
+          yield();
         }
       }
     }
-
-    // Disconnect from MQTT broker
-    mqttClient.disconnect();
   }
+
+  mqttStatus = "MQTT Ran.";
 }
+
 
 void handleHA() {
   String html = getHTMLHeader(2);
 
   uint8_t numChan = 7;
 
-  if (deviceType == 2) {
+  if (deviceType == DeviceType::GEM) {
     deviceName = "GEM";
     numChan = 32;
   }
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "-1");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  // here begin chunked transfer
+  server.send(200, "text/html", getHTMLHeader(1));
 
   if (WiFi.status() == WL_CONNECTED && mqttServer.isSet()) {
-
-
-    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    server.sendHeader("Pragma", "no-cache");
-    server.sendHeader("Expires", "-1");
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    // here begin chunked transfer
-    server.send(200, "text/html", getHTMLHeader(1));
-
+    mqttClient.setSocketTimeout(5);
     mqttClient.setServer(mqttServer, mqttPort);
+
     if (!mqttClient.connect(mqttClientID, mqttUser, mqttPass)) {
       html += "<div><h3>MQTT couldn't connect, please check your settings.</h3></div></html></body>";
-      server.send(200, "text/html", html);
-      server.close();
+      server.sendContent(html);
+      server.sendContent("");
+      server.client().stop();
       return;
     }
-
 
     html += "<div><h3>MQTT Values Sent:</h3>";
     String payload = "{\"unique_id\": \"" + deviceData.serialNumber + "v\", \"name\":\"" + deviceName + "-" + deviceData.serialNumber + " Volts\",\"state_topic\":\"" + deviceName + "-" + deviceData.serialNumber + "/v\",\"unit_of_measurement\":\"V\", \"state_class\": \"measurement\", \"dev\":{\"ids\":\"" + deviceData.serialNumber + "\",\"name\":\"" + deviceName + "-" + deviceData.serialNumber + "\",\"sw\":\"esp8266-custom\",\"mdl\":\"" + deviceName + "\",\"mf\":\"BrulTech Research Inc.\"}}";
@@ -1018,7 +1186,7 @@ void handleHA() {
     for (int x = 0; x < numChan; x++) {
 
       // if ecm aux 5 is pulse or gas
-      if (deviceType == 1 && x == 6 && mqttData.pulseTypes[0] != "energy") {
+      if (deviceType == DeviceType::ECM && x == 6 && mqttData.pulseTypes[0] != "energy") {
         payload = "{\"unique_id\": \"" + deviceData.serialNumber + "p" + (x + 1) + "_value\", \"name\":\"" + deviceName + "-" + deviceData.serialNumber + " P" + (x + 1) + " Value\",\"state_topic\":\"" + deviceName + "-" + deviceData.serialNumber + "/p" + (x + 1) + "/value\",\"unit_of_measurement\":\"" + mqttData.pulseUnits[0] + "\", \"device_class\": \"" + mqttData.pulseTypes[0] + "\", \"state_class\": \"measurement\", \"dev\":{\"ids\":\"" + deviceData.serialNumber + "\",\"name\":\"" + deviceName + "-" + deviceData.serialNumber + "\",\"sw\":\"esp8266-custom\",\"mdl\":\"" + deviceName + "\",\"mf\":\"BrulTech Research Inc.\"}}";
         topic = "homeassistant/sensor/" + deviceName + "-" + deviceData.serialNumber + "/p" + (x + 1) + "_value/config";
         if (!mqttClient.publish(topic.c_str(), payload.c_str(), true)) {
@@ -1056,7 +1224,7 @@ void handleHA() {
 
         html += payload + "<br><br>" + topic + "<br><br>";
 
-        if (deviceType == 2) {
+        if (deviceType == DeviceType::GEM) {
           payload = "{\"unique_id\": \"" + deviceData.serialNumber + "ch" + (x + 1) + "a\", \"name\":\"" + deviceName + "-" + deviceData.serialNumber + " CH" + (x + 1) + " Amps\",\"state_topic\":\"" + deviceName + "-" + deviceData.serialNumber + "/c" + (x + 1) + "/amp\",\"unit_of_measurement\":\"A\", \"state_class\": \"measurement\", \"dev\":{\"ids\":\"" + deviceData.serialNumber + "\",\"name\":\"" + deviceName + "-" + deviceData.serialNumber + "\",\"sw\":\"esp8266-custom\",\"mdl\":\"" + deviceName + "\",\"mf\":\"BrulTech Research Inc.\"}}";
           topic = "homeassistant/sensor/" + deviceName + "-" + deviceData.serialNumber + "/ch" + (x + 1) + "_amps/config";
           if (!mqttClient.publish(topic.c_str(), payload.c_str(), true)) {
@@ -1091,7 +1259,9 @@ void handleHA() {
   } else {
     html += "<div><h3>MQTT couldn't connect, please check your settings.</h3></div></html></body>";
   }
-  server.send(200, "text/html", html);
+  server.sendContent(html);
+  server.sendContent("");
+  server.client().stop();
 }
 
 void handleAP() {
@@ -1099,15 +1269,14 @@ void handleAP() {
     sendLogin(false);
   } else if (WiFi.status() != WL_CONNECTED) {
     // Root webpage
-    int networksFound = WiFi.scanNetworks();
+    scanNetworks();
+
     String html = getHTMLHeader(0);
 
     html += "<div><h2>Network Configuration</h2>";
     html += "<form action='/config'>";
     html += "<label>Select a network:</label> <select id='ssid' name='ssid'>";
-    for (int i = 0; i < networksFound; i++) {
-      html += "<option value='" + String(WiFi.SSID(i)) + "'>" + String(WiFi.SSID(i)) + " <b>RSSI:</b> " + String(WiFi.RSSI(i)) + "</option>";
-    }
+    html += networkOptions;
     html += "</select><br>";
     html += "<label>Or enter SSID:</label> <input id='custom_ssid' class='full' type='text' name='custom_ssid'><br>";
     html += "<label>Password:</label> <input class='full' maxlength='64' type='password' name='password' value=''><br>";
@@ -1153,7 +1322,7 @@ void getDeviceSettings() {
   Serial.flush();
   bool tryGEM = false;
 
-  deviceType = 3;
+  deviceType = DeviceType::Unknown;
 
   if (baud == 19200) {
     byte data = 0xFC;  // binary 0xFC
@@ -1168,7 +1337,7 @@ void getDeviceSettings() {
       dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
       if (dataLength > 32) {
-        deviceType = 1;
+        deviceType = DeviceType::ECM;
         processECMSettings();
       } else {
         tryGEM = true;
@@ -1192,8 +1361,8 @@ void getDeviceSettings() {
         gemSerial += c;          // Append the character to the string
       }
 
-      deviceType = 2;
-    } 
+      deviceType = DeviceType::GEM;
+    }
   }
 }
 
@@ -1217,7 +1386,7 @@ void getDeviceSettingsChangeBaud() {
     dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
 
     if (dataLength > 32) {
-      deviceType = 1;
+      deviceType = DeviceType::ECM;
       processECMSettings();
     } else {
       tryGEM = true;
@@ -1238,7 +1407,7 @@ void getDeviceSettingsChangeBaud() {
         gemSerial += c;          // Append the character to the string
       }
 
-      deviceType = 2;
+      deviceType = DeviceType::GEM;
     }
   }
 }
@@ -1295,7 +1464,7 @@ void processECMSettings() {
     ecmSettings.serialNumber = String((uint16_t)buffer[i]) + serialEnd;
     //debugText += " " + String(i);
 
-    i = i + 3;
+    i = i + 4;
 
     //debugText += " " + String(i);
     int y = 0;
@@ -1313,26 +1482,33 @@ void processECMSettings() {
   }
 }
 
+void handleScan() {
+  scanNetworks();
+  server.send(200, "text/html", networkOptions);
+}
+
+void scanNetworks() {
+  int networksFound = WiFi.scanNetworks();
+  networkOptions = "";
+  bool selected = false;
+  for (int i = 0; i < networksFound; i++) {
+    networkOptions += F("<option value='") + WiFi.SSID(i) + "'";
+    if (!selected) {
+      if (String(ssid).equals(WiFi.SSID(i))) {
+        networkOptions += F(" selected='selected'");
+        selected = true;
+      }
+    }
+    networkOptions += F("'>") + WiFi.SSID(i) + F(" <b>RSSI:</b> ") + WiFi.RSSI(i) + F("</option>");
+  }
+}
+
 void handleStationMode() {
   if (!isAuthenticated()) {
     sendLogin(false);
   } else {
-    ecmSettings.gotSettings = false;
-    getDeviceSettings();
-
-    int networksFound = WiFi.scanNetworks();
-    String networks = "";
-    bool selected = false;
-    for (int i = 0; i < networksFound; i++) {
-      networks += F("<option value='") + WiFi.SSID(i) + "'";
-      if (!selected) {
-        if (String(ssid).equals(WiFi.SSID(i))) {
-          networks += F(" selected='selected'");
-          selected = true;
-        }
-      }
-      networks += F("'>") + WiFi.SSID(i) + F(" <b>RSSI:</b> ") + WiFi.RSSI(i) + F("</option>");
-    }
+    //ecmSettings.gotSettings = false;
+    //getDeviceSettings();
 
     ntpClient.update();
 
@@ -1341,7 +1517,7 @@ void handleStationMode() {
     server.send(200, "text/html", getHTMLHeader(1));
 
     server.sendContent(F("<html><head><title>Brultech Config</title></head><body>"));
-    server.sendContent(F("<div><h3>Brultech Config ") + ver + F("</h3><br><a href='http://") + localAddress + F(".local/'>http://") + localAddress + F(".local/</a></div>"));
+    server.sendContent(String("<div><h3>Brultech Config ") + FW_VERSION + F("</h3><br><a href='http://") + localAddress + F(".local/'>http://") + localAddress + F(".local/</a></div>"));
     server.sendContent(F("<div id='network'><form action='/config'><h3>Menu</h3>"));
     server.sendContent(F("<a href='#network' class='button'>Network</a>"));
     server.sendContent(F("<a href='#baud' class='button'>Baud</a>"));
@@ -1357,7 +1533,7 @@ void handleStationMode() {
     // Network settings
     server.sendContent(F("<div id='network'><form action='/config'><h3>Network Settings</h3>"));
     server.sendContent(F("<h4 style='color:#4CAF50;'>Connected to: ") + WiFi.SSID() + F(" <br><br>RSSI: ") + WiFi.RSSI() + F("</h4>"));
-    server.sendContent(F("<label>Select a new network:</label> <select id='ssid' name='ssid'>") + networks + F("</select>"));
+    server.sendContent(F("<label>Select a new network:</label> <select id='ssid' name='ssid'>") + networkOptions + F("</select><button class='button' id='scan'>Scan</button>"));
     server.sendContent(F("<label>or enter the SSID:</label><input id='custom_ssid' class='full' maxlength='20' type='text' name='custom_ssid' value='") + String(ssid) + F("'>"));
     server.sendContent(F("<label>Password:</label><input class='full' maxlength='64' type='password' name='password' value=''>"));
     server.sendContent(F("<button class='button'>Submit</button></form></div>"));
@@ -1389,6 +1565,8 @@ void handleStationMode() {
     server.sendContent(F("</form></div>"));
 
     server.sendContent(F("<div id='client'><form action='/serial-to-tcp'><h3>Serial to TCP Client</h3>"));
+
+    //server.sendContent(F("<label>Connection:</label>") + tcpClientConnect + " " + String(connectTries));
     server.sendContent(F("<label>IP address:</label><input class='full' type='text' name='ip' value='") + tcpIP.toString() + F("'>"));
     server.sendContent(F("<label>Port:</label><input class='full' type='number' name='port' value='") + String(tcpPort) + F("'>"));
     server.sendContent(F("<button class='button'>Connect</button>"));
@@ -1426,23 +1604,64 @@ void handleStationMode() {
     server.sendContent(F("<form action='/stop-real'><input type='hidden' name='send_type' value='0'><button class='button'>Stop Packets</button></form>"));
     server.sendContent(F("</div>"));
     server.sendContent(F("<div id='settings'><h3>Device Settings</h3>"));
-    if (deviceType == 1) {
-      /*server.sendContent(F("<form action='/ecm-settings'><h3>ECM Settings</h3>Type is a fine-tune value that increases the sensed value with each tick (255 Max). Range halves the sensed value with each increase."));
-      server.sendContent(F("<label>Debug</label>" + debugText;
-      server.sendContent(F("<label>Settings Retrieved?</label>") + boolToText(ecmSettings.gotSettings, false));
-      server.sendContent(F("<label>Serial Number:</label>") + ecmSettings.serialNumber);
-      server.sendContent(F("<label>Firmware Version:</label>") + String(ecmSettings.firmwareVersion, 4));
-      server.sendContent(F("<label>Packet Send Interval:</label><input name='packet_send' class='small' type='number' min='1' max='255' value='") + String(ecmSettings.sendInterval) + F("'> (Max 255)"));
-      server.sendContent(F("<label>Channel 1 Config:</label>Type: <input name='ch1type' class='small' type='number' min='1' max='255' value='") + String(ecmSettings.ch1Set[0]) + "'> Range: <input class='small' name='ch1range' type='number' min='1' max='255' value='" + String(ecmSettings.ch1Set[1]) + F("'>"));
-      server.sendContent(F("<label>Channel 2 Config:</label>Type: <input name='ch2type' class='small' type='number' min='1' max='255' value='") + String(ecmSettings.ch2Set[0]) + "'> Range: <input class='small' name='ch2range' type='number' min='1' max='255' value='" + String(ecmSettings.ch2Set[1]) + F("'>"));
-      server.sendContent(F("<label>PT (Voltage) Config:</label>Type: <input name='pttype' class='small' type='number' min='1' max='255' value='") + String(ecmSettings.ptSet[0]) + "'>  Range: <input name='ptrange' class='small' type='number' min='1' max='255' value='" + String(ecmSettings.ptSet[1]) + F("'>"));
-      server.sendContent(F("<label>AUX Channel Double:</label>AUX1:  <input type='checkbox' name='aux1x2' ") + boolToText(ecmSettings.auxX2[0], true) + F("> AUX2: <input type='checkbox' name='aux2x2' ") + boolToText(ecmSettings.auxX2[1], true) + F("> AUX3: <input type='checkbox' name='aux3x2' ") + boolToText(ecmSettings.auxX2[2], true) + F("> AUX4:  <input type='checkbox' name='aux4x2' ") + boolToText(ecmSettings.auxX2[3], true) + F("> AUX5: <input type='checkbox' name='aux5x2' ") + boolToText(ecmSettings.auxX2[4], true) + F(" ><br>"));
-      server.sendContent(F("<label>Aux 5 Options:</label>Power: <input name='aux5option' ") + aux5Opt(0) + F(" type='radio' value='0'><br>Pulse: <input name='aux5option' ") + aux5Opt(1) + F(" type='radio' value='1'><br>DC: <input name='aux5option' ") + aux5Opt(3) + F(" type='radio' value='3'>"));
-      server.sendContent(F("<button class='button'>Update Settings</button></form>"));*/
-      server.sendContent(F("Please download our Interface Application program from <a href='https://www.brultech.com/software'>https://www.brultech.com/software</a> under the ECM-1240 section.<br><br>Web configuration will be included in a future firmware upgrade."));
+    if (deviceType == DeviceType::ECM) {
+      getDeviceSettings();
+      server.sendContent(F("<form action='/ecm-settings'>"));
+      server.sendContent(F("<h3 style='text-align:center;'>ECM Settings</h3>"));
+      server.sendContent(F("<p style='text-align:center;'>Type is a fine-tune value that increases the sensed value with each tick (255 Max).<br>Range halves the sensed value with each increase.</p>"));
 
-    } else if (deviceType == 2) {
-      server.sendContent(F("<b>GreenEye Monitor Detected:</b> ") + String(gemSerial) + F("<br><br><br>"));
+      /* General Settings - centered */
+      server.sendContent(F("<fieldset style='text-align:center; border:0;'><legend>General</legend>"));
+      server.sendContent(F("<label>Settings Retrieved?</label> ") + boolToText(ecmSettings.gotSettings, false) + F("<br>"));
+      server.sendContent(F("<label>Serial Number:</label> ") + ecmSettings.serialNumber + F("<br>"));
+      server.sendContent(F("<label>Firmware Version:</label> ") + String(ecmSettings.firmwareVersion, 4) + F("<br>"));
+      server.sendContent(F("<label>Packet Send Interval:</label> <input name='packet_send' class='small' type='number' min='1' max='255' value='")
+                         + String(ecmSettings.sendInterval) + F("'> (Max 255)"));
+      server.sendContent(F("</fieldset><br>"));
+
+      /* Channel Configuration Table - centered, no borders */
+      server.sendContent(F("<fieldset style='text-align:center; border:0;'><legend>Channel Settings</legend>"));
+      server.sendContent(F("<table style='margin:auto; border:none; border-collapse:collapse;'>"));
+      server.sendContent(F("<tr><th style='border:none;'>Channel</th><th style='border:none;'>Type</th><th style='border:none;'>Range</th></tr>"));
+      server.sendContent(F("<tr><td style='border:none;'>Ch1</td><td style='border:none;'><input name='ch1type' class='small' type='number' min='1' max='255' value='")
+                         + String(ecmSettings.ch1Set[0]) + F("'></td><td style='border:none;'><input class='small' name='ch1range' type='number' min='1' max='255' value='")
+                         + String(ecmSettings.ch1Set[1]) + F("'></td></tr>"));
+      server.sendContent(F("<tr><td style='border:none;'>Ch2</td><td style='border:none;'><input name='ch2type' class='small' type='number' min='1' max='255' value='")
+                         + String(ecmSettings.ch2Set[0]) + F("'></td><td style='border:none;'><input class='small' name='ch2range' type='number' min='1' max='255' value='")
+                         + String(ecmSettings.ch2Set[1]) + F("'></td></tr>"));
+      server.sendContent(F("<tr><td style='border:none;'>PT</td><td style='border:none;'><input name='pttype' class='small' type='number' min='1' max='255' value='")
+                         + String(ecmSettings.ptSet[0]) + F("'></td><td style='border:none;'><input class='small' name='ptrange' type='number' min='1' max='255' value='")
+                         + String(ecmSettings.ptSet[1]) + F("'></td></tr>"));
+      server.sendContent(F("</table>"));
+      server.sendContent(F("</fieldset><br>"));
+
+      /* AUX Channel Doubles - centered */
+      server.sendContent(F("<fieldset style='text-align:center; border:0;'><legend>AUX Channel Settings</legend>"));
+      server.sendContent(F("AUX1 <input type='checkbox' name='aux1x2' "));
+      server.sendContent(boolToText(ecmSettings.auxX2[0], true));
+      server.sendContent(F("> AUX2 <input type='checkbox' name='aux2x2' "));
+      server.sendContent(boolToText(ecmSettings.auxX2[1], true));
+      server.sendContent(F("> AUX3 <input type='checkbox' name='aux3x2' "));
+      server.sendContent(boolToText(ecmSettings.auxX2[2], true));
+      server.sendContent(F("> AUX4 <input type='checkbox' name='aux4x2' "));
+      server.sendContent(boolToText(ecmSettings.auxX2[3], true));
+      server.sendContent(F("> AUX5 <input type='checkbox' name='aux5x2' "));
+      server.sendContent(boolToText(ecmSettings.auxX2[4], true));
+      server.sendContent(F("<br><br><br>AUX5 Power Input<input name='aux5option' ") + aux5Opt(0) + F(" type='radio' value='0'><br>"));
+      server.sendContent(F("AUX5 Pulse Input<input name='aux5option' ") + aux5Opt(1) + F(" type='radio' value='1'><br>"));
+      server.sendContent(F("AUX5 DC Voltage<input name='aux5option' ") + aux5Opt(3) + F(" type='radio' value='3'>"));
+      server.sendContent(F("</fieldset><br>"));
+
+      /* Submit Button - centered */
+      server.sendContent(F("<span style='text-align:center;'><button class='button'>Update Settings</button></span>"));
+
+      server.sendContent(F("</form>"));
+
+
+      //server.sendContent(F("Please download our Interface Application program from <a href='https://www.brultech.com/software'>https://www.brultech.com/software</a> under the ECM-1240 section.<br><br>Web configuration will be included in a future firmware upgrade."));
+
+    } else if (deviceType == DeviceType::GEM) {
+      server.sendContent(F("<b>GreenEye Monitor Detected:</b> ") + deviceData.serialNumber + F("<br><br><br>"));
 
       if (tcpServerPort > 0) {
         String tmp = "192.168.4.1";
@@ -1477,7 +1696,7 @@ String aux5Opt(uint8_t opt) {
   if (ecmSettings.aux5Option == opt) {
     return "checked='checked'";
   } else {
-    return "";
+    return " ";
   }
 }
 
@@ -1490,7 +1709,7 @@ String getDigits(int number, int digits) {
 }
 
 void getData() {
-  int chNum = (deviceType == 1) ? 7 : 32;
+  int chNum = (deviceType == DeviceType::ECM) ? 7 : 32;
 
   server.sendContent(F("<h3>Data:</h3><br>"));
   server.sendContent(F("<table id='infoTable'>"));
@@ -1508,7 +1727,7 @@ void getData() {
   server.sendContent(F("<tr><th>CH</th><th>Wattseconds</th><th>Pol WS</th><th>Watts</th><th>Amps</th><th>kWh</th><th>Net kWh</th></tr>"));
 
   for (int i = 0; i < chNum; i++) {
-    if (deviceType != 1 || i < 2) {
+    if (deviceType != DeviceType::ECM || i < 2) {
       server.sendContent(F("<tr><td><b>CH"));
       server.sendContent(String(i + 1));
       server.sendContent(F("</b></td>"));
@@ -1545,7 +1764,7 @@ void getData() {
     server.sendContent(F("</td></tr>"));
   }
 
-  if (deviceType == 2) {
+  if (deviceType == DeviceType::GEM) {
     server.sendContent(F("<tr><td><b>T</b></td><td colspan='6'>"));
     for (int i = 0; i < 8; i++) {
       server.sendContent(F("CH"));
@@ -1570,113 +1789,45 @@ void getData() {
   server.client().stop();
 }
 
+// Simplified function
 String getHTMLHeader(uint8_t pageNum) {
   String htmlHeader = "<!DOCTYPE html lang='en'>";
   htmlHeader += "<head><title>Brultech ESP-8266 Setup</title>";
-  htmlHeader += "<style>";
-  htmlHeader += "body { background-color:#c3c3c3; font-family: Arial, sans-serif; }";
-  htmlHeader += "select { font-size: 16px; font-family: Arial, sans-serif; }";
-  htmlHeader += "div { background-color: #fff; border: 1px solid #ccc; box-shadow: 0 2px 2px rgba(0, 0, 0, 0.1); margin: 50px auto; width: 600px; padding: 20px; text-align: center; }";
-  htmlHeader += "h1 { margin: 0 0 20px 0; }";
-  htmlHeader += "label { padding-top:5px; display: block; font-size: 16px; font-weight: bold; margin-bottom: 5px; text-align: left; }";
-  htmlHeader += ".full { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding: 10px; width: 100% ; }";
-  htmlHeader += ".small { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding: 10px; width: 100px ; }";
-  htmlHeader += ".mid { box-sizing: border-box; border: 1px solid #ccc; font-size: 16px; padding-left: 10px; padding-right: 10px; width: 150px ; }";
-  htmlHeader += ".button { background-color: #4CAF50; border: none; color: #fff; cursor: pointer; font-size: 16px; margin-top: 20px; padding: 10px; display:inline-block; margin:5px; text-decoration: none; }";
-  htmlHeader += ".button:hover { background-color: #45a049; }";
-  htmlHeader += "p.error { color: #f00; font-size: 14px; margin: 10px 0; text-align: left; }";
-  htmlHeader += "#chanTable {width: 100%; border-collapse: collapse;}";
-  htmlHeader += "#chanTable th, td {border: 1px solid black; padding: 8px; text-align: center;}";
-  htmlHeader += "#chanTable th {background-color: #f2f2f2;}";
-  htmlHeader += "#infoTable { margin: 0 auto; border:none; }";
-  htmlHeader += "#infoTable td { border:none; }";
-  htmlHeader += "#pleaseWait { width:500px; }";
-  htmlHeader += "</style>";
-  htmlHeader += "<script>";
+  htmlHeader += FPSTR(HTML_CSS);
 
   if (pageNum != 4) {
     if (pageNum == 1) {
-      htmlHeader += "var ip = location.host; ";
-      htmlHeader += "document.addEventListener('DOMContentLoaded', function() { ";
-      htmlHeader += "var selectBox = document.getElementById('ssid'); ";
-      htmlHeader += "var textbox = document.getElementById('custom_ssid'); ";
-      htmlHeader += "selectBox.addEventListener('change', function() { ";
-      htmlHeader += "    textbox.value = selectBox.value; ";
-      htmlHeader += "}); ";
-      htmlHeader += "});";
-      htmlHeader += "function updateDiv() {";
-      htmlHeader += "const xhr = new XMLHttpRequest();";
-      htmlHeader += "xhr.onreadystatechange = function() {";
-      htmlHeader += "if (this.readyState === 4 && this.status === 200) {";
-      htmlHeader += "document.getElementById(\"data\").innerHTML = this.responseText;";
-      htmlHeader += "  }";
-      htmlHeader += "};";
-      htmlHeader += "xhr.open(\"GET\", \"/data\");";
-      htmlHeader += "xhr.send();";
-      htmlHeader += "const xhrTwo = new XMLHttpRequest();";
-      htmlHeader += "xhrTwo.onreadystatechange = function() {";
-      htmlHeader += "if (this.readyState === 4 && this.status === 200) {";
-      htmlHeader += "document.getElementById(\"serialDebug\").innerHTML = this.responseText;";
-      htmlHeader += "  }";
-      htmlHeader += "};";
-      htmlHeader += "xhrTwo.open(\"GET\", \"/serial-debug\");";
-      htmlHeader += "xhrTwo.send();";
-      htmlHeader += "}";
-      htmlHeader += "setInterval(updateDiv, 5000);";
-      /*htmlHeader += "window.addEventListener('DOMContentLoaded', (event) => {";
-      htmlHeader += "const myDiv = document.getElementById('advancedMqtt');";
-      htmlHeader += "const toggleLink = document.getElementById('toggleMqtt');";
-      htmlHeader += "toggleLink.addEventListener('click', function(event) {";
-      htmlHeader += "event.preventDefault();";
-      htmlHeader += "if (myDiv.style.display === 'none') {";
-      htmlHeader += "myDiv.style.display = 'block';";
-      htmlHeader += "this.innerHTML = 'Close Advanced Config';";
-      htmlHeader += "} else {";
-      htmlHeader += "myDiv.style.display = 'none';";
-      htmlHeader += "this.innerHTML = 'Open Advanced Config';";
-      htmlHeader += "}";
-      htmlHeader += "});";
-      htmlHeader += "});";*/
+      htmlHeader += FPSTR(HTML_JS_PAGE1);
     } else if (pageNum == 2) {
-      htmlHeader += "function goBack() { history.back(); }; setInterval(goBack,5000);";
+      htmlHeader += FPSTR(HTML_JS_PAGE2);
     } else {
-      htmlHeader += "document.addEventListener('DOMContentLoaded', function() { ";
-      htmlHeader += "var selectBox = document.getElementById('ssid'); ";
-      htmlHeader += "var textbox = document.getElementById('custom_ssid'); ";
-      htmlHeader += "selectBox.addEventListener('change', function() { ";
-      htmlHeader += "    textbox.value = selectBox.value; ";
-      htmlHeader += "}); ";
-      htmlHeader += "var link = document.getElementById('localLink'); ";
-      htmlHeader += "function copyText() { ";
-      htmlHeader += "var linkText = link.innerText || link.textContent; ";
-      htmlHeader += "navigator.clipboard.writeText(linkText); ";
-      htmlHeader += "}; ";
-      htmlHeader += "link.addEventListener('click', function(event) { ";
-      htmlHeader += "event.preventDefault(); ";
-      htmlHeader += "copyTextToClipboard('localLink'); ";
-      htmlHeader += "});";
-      htmlHeader += "document.getElementById('saveLocal').addEventListener('click', () => {";
-      htmlHeader += "    const textToCopy = 'http://" + localAddress + ".local';";
-      htmlHeader += "    const textArea = document.createElement('textarea');";
-      htmlHeader += "    textArea.value = textToCopy;";
-      htmlHeader += "    document.body.appendChild(textArea);";
-      htmlHeader += "    textArea.select();";
-      htmlHeader += "    try {";
-      htmlHeader += "        document.execCommand('copy');";
-      htmlHeader += "        alert('Local address copied to clipboard.');";
-      htmlHeader += "    } catch (err) {";
-      htmlHeader += "        console.error('Failed to copy text: ', err);";
-      htmlHeader += "    }";
-      htmlHeader += "    document.body.removeChild(textArea);";
-      htmlHeader += "});";
-      htmlHeader += "});";
+      htmlHeader += "<script> document.addEventListener('DOMContentLoaded', function() {";
+      htmlHeader += "  var selectBox = document.getElementById('ssid');";
+      htmlHeader += "  var textbox = document.getElementById('custom_ssid');";
+      htmlHeader += "  selectBox.addEventListener('change', function() { textbox.value = selectBox.value; });";
+      htmlHeader += "  function copyTextToClipboard(text) {";
+      htmlHeader += "    navigator.clipboard.writeText(text).then(function() {";
+      htmlHeader += "      alert('Text copied to clipboard.');";
+      htmlHeader += "    }, function(err) {";
+      htmlHeader += "      console.error('Failed to copy text: ', err);";
+      htmlHeader += "      alert('Failed to copy text.');";
+      htmlHeader += "    });";
+      htmlHeader += "  }";
+      htmlHeader += "  var link = document.getElementById('localLink');";
+      htmlHeader += "  link.addEventListener('click', function(event) {";
+      htmlHeader += "    event.preventDefault();";
+      htmlHeader += "    var linkText = link.innerText || link.textContent;";
+      htmlHeader += "    copyTextToClipboard(linkText);";
+      htmlHeader += "  });";
+      htmlHeader += "  document.getElementById('saveLocal').addEventListener('click', () => {";
+      htmlHeader += "    const textToCopy = 'http://'" + localAddress + ".local/';";
+      htmlHeader += "    copyTextToClipboard(textToCopy);";
+      htmlHeader += "  });";
+      htmlHeader += "}); </script>";
     }
   }
 
-  htmlHeader += "</script>";
-  htmlHeader += "</head>";
-  htmlHeader += "<body>";
-
+  htmlHeader += "</head><body>";
   return htmlHeader;
 }
 
@@ -1690,6 +1841,9 @@ void handleMQTTDebug() {
   htmlPage += "<h1>MQTT Data</h1>\n";
   htmlPage += "<p>Configuration Status: ";
   htmlPage += (mqttData.isConfigured ? "Configured" : "Not Configured");
+  htmlPage += "</p>\n";
+  htmlPage += "<p>Status: ";
+  htmlPage += mqttStatus;
   htmlPage += "</p>\n";
 
   // Loop through channel data and display
@@ -1824,9 +1978,9 @@ void handleECMSettings() {
   if (ch1type > 0 && ch2type > 0 && ch1range > 0 && ch2range > 0 && pttype > 0 && ptrange > 0 && packet_send > 0) {
     String commandsSent = "";
     byte data = 0xFC;  // binary 0xFC
-    if (fwVer > 1.031) {
-      if (packet_send != ecmSettings.sendInterval || ch1type != ecmSettings.ch1Set[0] || ch1range != ecmSettings.ch1Set[1] || ch2type != ecmSettings.ch2Set[0] || ch2range != ecmSettings.ch2Set[1] || pttype != ecmSettings.ptSet[0] || ptrange != ecmSettings.ptSet[1]) {
-        sendSettings = "SETALL1," + zeroPad(String(ch1type), 3) + ",";
+    if (fwVer > 5) {
+      if (auxChange || packet_send != ecmSettings.sendInterval || ch1type != ecmSettings.ch1Set[0] || ch1range != ecmSettings.ch1Set[1] || ch2type != ecmSettings.ch2Set[0] || ch2range != ecmSettings.ch2Set[1] || pttype != ecmSettings.ptSet[0] || ptrange != ecmSettings.ptSet[1]) {
+        sendSettings = "1," + zeroPad(String(ch1type), 3) + ",";
         sendSettings += zeroPad(String(ch1range), 3) + ",";
         sendSettings += zeroPad(String(ch2type), 3) + ",";
         sendSettings += zeroPad(String(ch2range), 3) + ",";
@@ -1954,7 +2108,7 @@ String boolToText(bool check, bool input) {
     if (!input) {
       return "False";
     } else {
-      return "";
+      return " ";
     }
   }
 }
@@ -2023,9 +2177,9 @@ void handleSerialToTcp() {
 
     if (tcpClient.connected()) {
       tcpClient.stop();
+      tcpClient.setTimeout(100);
 
       if (tcpClient.connect(tcpIP, tcpPort)) {
-        tcpClient.setTimeout(100);
         html += "<h5>Connected to TCP server</h5>";
       } else {
         html += "<h5>Connection failed</h5>";
