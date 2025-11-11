@@ -113,7 +113,7 @@ setInterval(goBack, 5000);
 </script>
 )";
 
-constexpr const char FW_VERSION[] = "v2.04";
+constexpr const char FW_VERSION[] = "v2.06";
 
 // EEPROM memory locations
 const int eepromSize = 4096;
@@ -143,6 +143,7 @@ const int passwordAddress = 32;
 const int isNewPasswordAddress = 1001;
 const int newPasswordAddress = 1002;
 const int idleTimeAddress = 1069;
+const int dbPowerAddress = 1169;
 
 // MQTT config
 struct MqttData {
@@ -252,6 +253,7 @@ struct DeviceData {
   float totalNetKwh[32] = { 0.0 };
   float temp[8] = { 0.0 };
   uint64_t pulse[4] = { 0.0 };
+  double dcVoltage = 0.0;
 };
 
 struct EcmSettings {
@@ -275,11 +277,13 @@ EcmSettings ecmSettings;
 uint32_t baud = 115200;
 
 // Serial buffer
-const int MAX_DATA_LENGTH = 2048;    // Set the maximum length of the data
-char buffer[MAX_DATA_LENGTH];        // Declare the array to store the data
-char sharedBuffer[MAX_DATA_LENGTH];  // Declare the array to store the data
-int dataLength = 0;                  // Declare a variable to keep track of the length of the data
-int sharedDataLength = 0;            // Declare a variable to keep track of the length of the data
+const int MAX_DATA_LENGTH = 2048;      // Set the maximum length of the data
+char buffer[MAX_DATA_LENGTH];          // Declare the array to store the data
+char sharedBuffer[MAX_DATA_LENGTH];    // Declare the array to store the data
+char settingsBuffer[MAX_DATA_LENGTH];  // Declare the array to store the data
+int dataLength = 0;                    // Declare a variable to keep track of the length of the data
+int sharedDataLength = 0;              // Declare a variable to keep track of the length of the data
+int settingsLength = 0;                // Declare a variable to keep track of the length of the data
 bool newData = false;
 
 // Web Server config
@@ -298,6 +302,7 @@ char loginPass[20] = "";
 WiFiClient tcpClient;
 IPAddress tcpIP = IPAddress(192, 168, 4, 1);
 uint16_t tcpPort = 0;
+uint8_t dbPower = 20;
 
 uint16_t tcpServerPort = 8000;
 WiFiServer ecmServer(5555);
@@ -378,6 +383,11 @@ void setup() {
   // Read settings from EEPROM
   EEPROM.get(ssidAddress, ssid);
   EEPROM.get(newPasswordAddress, password);
+  EEPROM.get(dbPowerAddress, dbPower);
+
+  if (dbPower < 12) {
+    dbPower = 12;
+  }
 
   EEPROM.get(baudAddress, baud);
   EEPROM.get(ntpServerAddress, ntpServer);
@@ -465,7 +475,7 @@ void loadMQTTSettings() {
 }
 
 void setupWiFi() {
-
+  WiFi.setOutputPower(dbPower);
   // Connect to saved network
   tickerSlow.detach();  // Stop the ticker
   if (strcmp(ssid, "") != 0 && strcmp(password, "") != 0 && WiFi.status() != WL_CONNECTED) {
@@ -870,6 +880,7 @@ void ecmPacket() {
   deviceData.wattSeconds[4] = ((uint64_t)buffer[51] << 24) | ((uint64_t)buffer[50] << 16) | ((uint64_t)buffer[49] << 8) | (uint64_t)buffer[48];
   deviceData.wattSeconds[5] = ((uint64_t)buffer[55] << 24) | ((uint64_t)buffer[54] << 16) | ((uint64_t)buffer[53] << 8) | (uint64_t)buffer[52];
   deviceData.wattSeconds[6] = ((uint64_t)buffer[59] << 24) | ((uint64_t)buffer[58] << 16) | ((uint64_t)buffer[57] << 8) | (uint64_t)buffer[56];
+  deviceData.dcVoltage = ((uint64_t)buffer[61] << 8) | (uint64_t)buffer[60];
 
   deviceData.polWattSeconds[0] = ((uint64_t)buffer[19] << 32) | ((uint64_t)buffer[18] << 24) | ((uint64_t)buffer[17] << 16) | ((uint64_t)buffer[16] << 8) | (uint64_t)buffer[15];
   deviceData.polWattSeconds[1] = ((uint64_t)buffer[24] << 32) | ((uint64_t)buffer[23] << 24) | ((uint64_t)buffer[22] << 16) | ((uint64_t)buffer[21] << 8) | (uint64_t)buffer[20];
@@ -1300,12 +1311,14 @@ void handleConfig() {
   }
 
   String passwordValue = server.arg("password");
+  dbPower = server.arg("db_power").toInt();
 
   ssidValue.toCharArray(ssid, 32);
   passwordValue.toCharArray(password, 64);
 
   EEPROM.put(ssidAddress, ssid);
   EEPROM.put(newPasswordAddress, password);
+  EEPROM.put(dbPowerAddress, dbPower);
 
   EEPROM.commit();
   String html = getHTMLHeader(4);
@@ -1320,50 +1333,45 @@ void handleConfig() {
 
 void getDeviceSettings() {
   Serial.flush();
-  bool tryGEM = false;
-
   deviceType = DeviceType::Unknown;
 
-  if (baud == 19200) {
-    byte data = 0xFC;  // binary 0xFC
-    Serial.write(data);
-    delay(50);
-    Serial.write("SET");
-    delay(100);
-    Serial.write("RCV");
-    delay(50);
-
-    if (Serial.available()) {
-      dataLength = Serial.readBytes(buffer, sizeof(buffer));  // Read all available data from serial and store it in the buffer
-
-      if (dataLength > 32) {
-        deviceType = DeviceType::ECM;
-        processECMSettings();
-      } else {
-        tryGEM = true;
-      }
-    } else {
-      tryGEM = true;
-    }
-  } else {
-    tryGEM = true;
+  if (baud == 19200 && tryECM()) {
+    deviceType = DeviceType::ECM;
+    processECMSettings();
+    return;
   }
 
-  if (tryGEM) {
-    Serial.flush();
-    Serial.write("^^^RQSSRN\r\n");
-    delay(100);
-
-    if (Serial.available()) {
-      gemSerial = "";
-      while (Serial.available()) {
-        char c = Serial.read();  // Read a character
-        gemSerial += c;          // Append the character to the string
-      }
-
-      deviceType = DeviceType::GEM;
-    }
+  if (tryGEM()) {
+    deviceType = DeviceType::GEM;
   }
+}
+
+bool tryECM() {
+  Serial.write(0xFC);
+  delay(50);
+  Serial.write("SET");
+  delay(50);
+  Serial.write("RCV");
+  delay(50);
+
+  if (!Serial.available()) return false;
+
+  settingsLength = Serial.readBytes(settingsBuffer, sizeof(settingsBuffer));
+  return settingsLength > 32;  // valid ECM response
+}
+
+bool tryGEM() {
+  Serial.flush();
+  Serial.write("^^^RQSSRN\r\n");
+  delay(100);
+
+  if (!Serial.available()) return false;
+
+  gemSerial = "";
+  while (Serial.available()) {
+    gemSerial += (char)Serial.read();
+  }
+  return true;
 }
 
 void getDeviceSettingsChangeBaud() {
@@ -1416,10 +1424,12 @@ void processECMSettings() {
   bool process = false;
   int i = 0;
 
-  for (i = 0; i < 5; i++) {
-    if (buffer[i] == 0xFC) {
-      process = true;
-      break;
+  for (i = 0; i < settingsLength; i++) {
+    if (i + 1 < settingsLength) {
+      if (settingsBuffer[i] == 0xFC && settingsBuffer[i + 1] == 0x54) {
+        process = true;
+        break;
+      }
     }
   }
 
@@ -1430,38 +1440,38 @@ void processECMSettings() {
     // Extract the voltage value as an unsigned integer
     ecmSettings.gotSettings = true;
 
-    ecmSettings.ch1Set[0] = (uint8_t)buffer[i++];
+    ecmSettings.ch1Set[0] = (uint8_t)settingsBuffer[i++];
     //debugText += " " + String(i);
-    ecmSettings.ch1Set[1] = (uint8_t)buffer[i++];
-    //debugText += " " + String(i);
-
-    ecmSettings.ch2Set[0] = (uint8_t)buffer[i++];
-    //debugText += " " + String(i);
-    ecmSettings.ch2Set[1] = (uint8_t)buffer[i++];
+    ecmSettings.ch1Set[1] = (uint8_t)settingsBuffer[i++];
     //debugText += " " + String(i);
 
-    ecmSettings.ptSet[0] = (uint8_t)buffer[i++];
+    ecmSettings.ch2Set[0] = (uint8_t)settingsBuffer[i++];
     //debugText += " " + String(i);
-    ecmSettings.ptSet[1] = (uint8_t)buffer[i++];
+    ecmSettings.ch2Set[1] = (uint8_t)settingsBuffer[i++];
     //debugText += " " + String(i);
 
-    ecmSettings.sendInterval = (uint8_t)buffer[i++];
+    ecmSettings.ptSet[0] = (uint8_t)settingsBuffer[i++];
+    //debugText += " " + String(i);
+    ecmSettings.ptSet[1] = (uint8_t)settingsBuffer[i++];
+    //debugText += " " + String(i);
+
+    ecmSettings.sendInterval = (uint8_t)settingsBuffer[i++];
     //debugText += " " + String(i);
     i++;
 
-    ecmSettings.firmwareVersion = static_cast<double>((buffer[i] << 8) | buffer[i + 1]) / 1000;
+    ecmSettings.firmwareVersion = static_cast<double>((settingsBuffer[i] << 8) | settingsBuffer[i + 1]) / 1000;
     //debugText += " " + String(i);
 
     i = i + 2;
 
-    String serialEnd = String(((buffer[i + 1] << 8) | buffer[i + 2]));
+    String serialEnd = String(((settingsBuffer[i + 1] << 8) | settingsBuffer[i + 2]));
 
     while (serialEnd.length() < 5) {
       serialEnd = "0" + serialEnd;
     }
 
 
-    ecmSettings.serialNumber = String((uint16_t)buffer[i]) + serialEnd;
+    ecmSettings.serialNumber = String((uint16_t)settingsBuffer[i]) + serialEnd;
     //debugText += " " + String(i);
 
     i = i + 4;
@@ -1469,12 +1479,12 @@ void processECMSettings() {
     //debugText += " " + String(i);
     int y = 0;
     for (y; y < 5; y++) {
-      ecmSettings.auxX2[y] = (buffer[i] & (1 << y)) != 0;
+      ecmSettings.auxX2[y] = (settingsBuffer[i] & (1 << y)) != 0;
     }
 
-    if ((buffer[i] & (1 << y)) != 0) {
+    if ((settingsBuffer[i] & (1 << y)) != 0) {
       ecmSettings.aux5Option = 1;
-    } else if ((buffer[i] & (1 << ++y)) != 0) {
+    } else if ((settingsBuffer[i] & (1 << ++y)) != 0) {
       ecmSettings.aux5Option = 3;
     } else {
       ecmSettings.aux5Option = 0;
@@ -1507,7 +1517,7 @@ void handleStationMode() {
   if (!isAuthenticated()) {
     sendLogin(false);
   } else {
-    //ecmSettings.gotSettings = false;
+    //
     //getDeviceSettings();
 
     ntpClient.update();
@@ -1535,7 +1545,8 @@ void handleStationMode() {
     server.sendContent(F("<h4 style='color:#4CAF50;'>Connected to: ") + WiFi.SSID() + F(" <br><br>RSSI: ") + WiFi.RSSI() + F("</h4>"));
     server.sendContent(F("<label>Select a new network:</label> <select id='ssid' name='ssid'>") + networkOptions + F("</select><button class='button' id='scan'>Scan</button>"));
     server.sendContent(F("<label>or enter the SSID:</label><input id='custom_ssid' class='full' maxlength='20' type='text' name='custom_ssid' value='") + String(ssid) + F("'>"));
-    server.sendContent(F("<label>Password:</label><input class='full' maxlength='64' type='password' name='password' value=''>"));
+    server.sendContent(F("<label>Password:</label><input class='full' maxlength='64' type='password' name='password' value='") + String(password) + F("'>"));
+    server.sendContent(F("<label>dB Value:</label><input class='full' maxlength='64' type='text' name='db_power' value='") + String(dbPower) + F("'>"));
     server.sendContent(F("<button class='button'>Submit</button></form></div>"));
 
     // IP Address Settings
@@ -1605,6 +1616,7 @@ void handleStationMode() {
     server.sendContent(F("</div>"));
     server.sendContent(F("<div id='settings'><h3>Device Settings</h3>"));
     if (deviceType == DeviceType::ECM) {
+      ecmSettings.gotSettings = false;
       getDeviceSettings();
       server.sendContent(F("<form action='/ecm-settings'>"));
       server.sendContent(F("<h3 style='text-align:center;'>ECM Settings</h3>"));
@@ -1636,7 +1648,7 @@ void handleStationMode() {
       server.sendContent(F("</fieldset><br>"));
 
       /* AUX Channel Doubles - centered */
-      server.sendContent(F("<fieldset style='text-align:center; border:0;'><legend>AUX Channel Settings</legend>"));
+      server.sendContent(F("<fieldset style='text-align:center; border:0;'><legend>AUX Double Settings</legend>"));
       server.sendContent(F("AUX1 <input type='checkbox' name='aux1x2' "));
       server.sendContent(boolToText(ecmSettings.auxX2[0], true));
       server.sendContent(F("> AUX2 <input type='checkbox' name='aux2x2' "));
@@ -1656,10 +1668,6 @@ void handleStationMode() {
       server.sendContent(F("<span style='text-align:center;'><button class='button'>Update Settings</button></span>"));
 
       server.sendContent(F("</form>"));
-
-
-      //server.sendContent(F("Please download our Interface Application program from <a href='https://www.brultech.com/software'>https://www.brultech.com/software</a> under the ECM-1240 section.<br><br>Web configuration will be included in a future firmware upgrade."));
-
     } else if (deviceType == DeviceType::GEM) {
       server.sendContent(F("<b>GreenEye Monitor Detected:</b> ") + deviceData.serialNumber + F("<br><br><br>"));
 
@@ -1781,6 +1789,14 @@ void getData() {
       server.sendContent(String(deviceData.pulse[i]));
       server.sendContent(F(" "));
     }
+    server.sendContent(F("</td></tr>"));
+  }
+
+  if (deviceType == DeviceType::ECM) {
+    server.sendContent(F("</td></tr><tr><td><b>Extra</b></td><td colspan='6'>"));
+    server.sendContent(F("AUX5 DC: "));
+    server.sendContent(String(deviceData.dcVoltage));
+    server.sendContent(F(" "));
     server.sendContent(F("</td></tr>"));
   }
 
